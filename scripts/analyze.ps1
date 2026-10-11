@@ -14,12 +14,20 @@ param(
     [string]$NeverTouchFile = '',
     [string]$OutFile = '',
     [int]$TopGrowth = 25,
-    [int]$MinFindingMB = 50
+    [int]$MinFindingMB = 50,
+    # How the sizes of the matched rule paths are measured. `mft` reads them out
+    # of one $MFT pass (seconds), `walk` walks every path (about 90 seconds on a
+    # normal C: drive), `auto` prefers the MFT and silently falls back to walking.
+    [ValidateSet('auto', 'mft', 'walk')]
+    [string]$SizeEngine = 'auto'
 )
 
 $ErrorActionPreference = 'Continue'
 $script:Prefix = '\\?\'
 $skillRoot = Split-Path -Parent $PSScriptRoot
+$dirSizeScript = Join-Path $PSScriptRoot 'dirsizes.ps1'
+$psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
 
 if (-not $RulesFile -or $RulesFile.Trim() -eq '') { $RulesFile = Join-Path $skillRoot 'rules\caches.json' }
 if (-not $NeverTouchFile -or $NeverTouchFile.Trim() -eq '') { $NeverTouchFile = Join-Path $skillRoot 'rules\never-touch.json' }
@@ -190,17 +198,92 @@ if ($never.denyNamePatterns) { $denyNames = @($never.denyNamePatterns) }
 
 $findings = New-Object System.Collections.Generic.List[object]
 
-foreach ($rule in $rules.rules) {
+# Resolve every rule pattern once, up front. The sizes are then measured in one
+# go instead of one directory walk per path - walking the matched paths used to
+# be by far the slowest part of analyze (about 90 seconds on a normal C: drive,
+# most of it re-walking caches the scan had already measured).
+$ruleList = @($rules.rules)
+$resolvedByRule = New-Object System.Collections.Generic.List[object]
+$wantDirs = New-Object System.Collections.Generic.List[string]
+foreach ($rule in $ruleList) {
+    $resolved = New-Object System.Collections.Generic.List[object]
+    foreach ($pat in $rule.paths) {
+        foreach ($r in (Resolve-Pattern $pat)) {
+            $isFile = $false
+            try { $isFile = [System.IO.File]::Exists((Add-Prefix $r)) } catch { $isFile = $false }
+            $resolved.Add([pscustomobject]@{ path = $r; isFile = $isFile })
+            if (-not $isFile) { $wantDirs.Add($r) }
+        }
+    }
+    $resolvedByRule.Add($resolved)
+}
+
+$script:sizeMap = @{}
+$sizeSource = 'walk'
+$sizeNotes = @()
+if ($SizeEngine -ne 'walk' -and $wantDirs.Count -gt 0) {
+    $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $listFile = Join-Path ([System.IO.Path]::GetTempPath()) ('diskaudit-targets-' + $tag + '.txt')
+    $dsOut = Join-Path ([System.IO.Path]::GetTempPath()) ('diskaudit-dirsizes-' + $tag + '.json')
+    try {
+        # WriteAllLines needs a real string[], not the Object[] that the pipeline
+        # produces; PowerShell reports the mismatch as a binding error otherwise.
+        [System.IO.File]::WriteAllLines($listFile, [string[]]@($wantDirs | Sort-Object -Unique), (New-Object System.Text.UTF8Encoding($false)))
+        # A child process on purpose: the helper prints its own RESULT line, and
+        # anything that leaked into this script's output would be mistaken for the
+        # analysis result by whoever parses it. A child also keeps the helper's
+        # `exit` codes and its Add-Type compilation from touching this run.
+        $dsArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dirSizeScript,
+                    '-PathsFile', $listFile, '-OutFile', $dsOut, '-Engine', $SizeEngine)
+        [void](& $psExe @dsArgs 2>&1 | Out-Null)
+        if (Test-Path -LiteralPath $dsOut) {
+            $ds = Get-Content -LiteralPath $dsOut -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($ds.engine -eq 'mft') {
+                foreach ($s in $ds.sizes) {
+                    $k = ([string]$s.path).TrimEnd('\').ToLowerInvariant()
+                    $sizeMap[$k] = [math]::Round([double]$s.bytes / 1MB, 0)
+                }
+                $sizeSource = 'mft'
+                if ([int]$ds.missing -gt 0) {
+                    $sizeNotes += ([string]$ds.missing + ' of ' + [string]$ds.requested + ' matched directories were not in the MFT and were walked instead')
+                }
+            }
+            else {
+                $sizeNotes += ('the MFT directory sizer reported engine=' + [string]$ds.engine + ' (' + [string]$ds.reason + '); every path was walked')
+            }
+        }
+        else {
+            $sizeNotes += 'the MFT directory sizer produced no output; every path was walked'
+        }
+    }
+    catch {
+        $sizeNotes += ('the MFT directory sizer failed: ' + $_.Exception.Message)
+    }
+    finally {
+        Remove-Item -LiteralPath $listFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $dsOut -Force -ErrorAction SilentlyContinue
+    }
+}
+# Anything the MFT map does not cover is walked once and remembered, so a path
+# named by several rules is never walked twice.
+function Get-PathSizeCached([string]$path, [bool]$isFile) {
+    if ($isFile) { return (Get-PathSizeMB $path) }
+    $k = $path.TrimEnd('\').ToLowerInvariant()
+    if ($script:sizeMap.ContainsKey($k)) { return [int]$script:sizeMap[$k] }
+    $mb = Get-PathSizeMB $path
+    if ($mb -ge 0) { $script:sizeMap[$k] = $mb }
+    return $mb
+}
+
+for ($ri = 0; $ri -lt $ruleList.Count; $ri++) {
+    $rule = $ruleList[$ri]
     $matches = New-Object System.Collections.Generic.List[object]
     $sum = 0
-    foreach ($pat in $rule.paths) {
-        $resolved = Resolve-Pattern $pat
-        foreach ($r in $resolved) {
-            $mb = Get-PathSizeMB $r
-            if ($mb -lt 0) { continue }
-            $sum += $mb
-            $matches.Add([pscustomobject]@{ path = $r; mb = $mb })
-        }
+    foreach ($cand in $resolvedByRule[$ri]) {
+        $mb = Get-PathSizeCached $cand.path $cand.isFile
+        if ($mb -lt 0) { continue }
+        $sum += $mb
+        $matches.Add([pscustomobject]@{ path = $cand.path; mb = $mb })
     }
     $matches = @($matches | Sort-Object mb -Descending)
     if ($matches.Count -eq 0) { continue }
@@ -309,21 +392,47 @@ foreach ($p in $neverPaths) {
 
 # ---------------- growth vs previous snapshot ----------------
 
+# The two engines do not count the same thing, so a walk snapshot and an MFT
+# snapshot of an identical disk differ by a small constant factor:
+#   - walk counts a hard-linked file once per directory that holds a name for
+#     it (System32\en-US\*.mui are also named under WinSxS, so they are summed
+#     twice), which inflates its total.
+#   - MFT sums each file record once, but also sees directory entries walked
+#     filtering hides (mounted WinSxS\FileMaps), which inflates its dir count.
+# Observed on a real C: drive: total -0.6%, files -0.3%, dirs +4%. Deltas below
+# 2% are therefore noise when the two snapshots used different engines, and the
+# comparison is flagged so the report can say so instead of crying "growth".
+$curEngine = 'walk'
+if ($snap.engine -and ([string]$snap.engine).Trim() -ne '') { $curEngine = ([string]$snap.engine).Trim().ToLowerInvariant() }
+$engineNotes = @()
+if ($snap.engineNotes) { $engineNotes = @($snap.engineNotes) }
+
 $prevFile = $null
+$prevEngine = ''
 $curResolved = (Resolve-Path -LiteralPath $Snapshot).Path
 $curSig = Get-RootSignature $snap
 foreach ($s in ($allScans | Select-Object -First 20)) {
     if ($s.FullName -eq $curResolved) { continue }
     try { $cand = Get-Content -LiteralPath $s.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { continue }
-    if ((Get-RootSignature $cand) -eq $curSig) { $prevFile = $s.FullName; break }
+    if ((Get-RootSignature $cand) -eq $curSig) {
+        $prevFile = $s.FullName
+        # Snapshots written before the MFT engine existed carry no engine field.
+        $prevEngine = 'walk'
+        if ($cand.engine -and ([string]$cand.engine).Trim() -ne '') { $prevEngine = ([string]$cand.engine).Trim().ToLowerInvariant() }
+        break
+    }
 }
 
 $growth = New-Object System.Collections.Generic.List[object]
 $prevAt = $null
+$grandCur = [int64]0
+foreach ($r in @($snap.roots)) { $grandCur += [int64]$r.totalMB }
+$grandPrev = [int64]0
 if ($prevFile) {
     $prev = Get-Content -LiteralPath $prevFile -Raw -Encoding UTF8 | ConvertFrom-Json
     $prevAt = $prev.scannedAt
+    foreach ($r in @($prev.roots)) { $grandPrev += [int64]$r.totalMB }
 
     $curMap = @{}
     foreach ($r in $snap.roots) {
@@ -352,6 +461,33 @@ if ($prevFile) {
         }
     }
     $growth = @($growth | Sort-Object deltaMB -Descending | Select-Object -First $TopGrowth)
+}
+
+# ---------------- engine accounting for the comparison ----------------
+
+$totalDeltaMB = [int64]0
+if ($prevFile) { $totalDeltaMB = $grandCur - $grandPrev }
+
+$engineMismatch = $false
+$noteCode = 'comparable'
+$note = 'Both snapshots came from the same engine; per-directory deltas are directly comparable.'
+if (-not $prevFile) {
+    # An empty growth list here means "nothing to compare against", which is a
+    # very different statement from "nothing changed". Say which one it is.
+    $noteCode = 'no-previous'
+    $note = ('No earlier snapshot with the same root set and depth was found, so the growth list is empty because ' +
+             'this is the first scan of its kind, not because the disk stopped changing.')
+}
+elseif ($prevEngine -ne '' -and $prevEngine -ne $curEngine) {
+    $engineMismatch = $true
+    $noteCode = 'engine-mismatch'
+    $note = ('Previous snapshot used engine=' + $prevEngine + ' but this one used engine=' + $curEngine +
+             '. The engines count hard links differently, so absolute totals shift by roughly 1% (walk is higher) ' +
+             'and directory counts shift by a few percent. Per-directory deltas still show the direction of change, ' +
+             'but anything under about 2% of the directory size is within cross-engine noise and must not be reported as growth.')
+}
+if ($engineNotes.Count -gt 0) {
+    $note = ($note + ' Scan notes: ' + (@($engineNotes) -join ' | '))
 }
 
 # ---------------- anomalies ----------------
@@ -420,6 +556,20 @@ $doc = [pscustomobject]@{
     snapshotAt = $snap.scannedAt
     previousSnapshot = $prevFile
     previousAt = $prevAt
+    # Whether the growth numbers below may be read literally. See the
+    # engine-mismatch note above; the report must honour this flag.
+    comparison = [pscustomobject]@{
+        engine = $curEngine
+        previousEngine = $prevEngine
+        engineMismatch = $engineMismatch
+        currentTotalMB = $grandCur
+        previousTotalMB = $(if ($prevFile) { $grandPrev } else { $null })
+        totalDeltaMB = $(if ($prevFile) { $totalDeltaMB } else { $null })
+        noteCode = $noteCode
+        note = $note
+    }
+    engine = $curEngine
+    engineNotes = @($engineNotes)
     auditHome = $auditHome
     host = $snap.host
     drives = $snap.drives
@@ -431,6 +581,11 @@ $doc = [pscustomobject]@{
         reclaimableMB = $safeMB + $cautionMB
     }
     findings = @($findings | Sort-Object -Property @{Expression = 'mb'; Descending = $true})
+    # `mft` means the finding sizes came out of one $MFT pass, `walk` means every
+    # matched path was walked. The two count hard links differently (~1% apart),
+    # so this is recorded rather than left implicit.
+    sizeSource = $sizeSource
+    sizeNotes = @($sizeNotes)
     neverTouch = @($neverFindings | Sort-Object mb -Descending)
     growth = $growth
     anomalies = @($anomalies | Sort-Object mb -Descending)
@@ -455,4 +610,6 @@ if (-not $OutFile -or $OutFile.Trim() -eq '') {
 }
 $doc | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $OutFile -Encoding UTF8
 
-Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count)
+$prevEngineTag = 'none'
+if ($prevEngine -ne '') { $prevEngineTag = $prevEngine }
+Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource)

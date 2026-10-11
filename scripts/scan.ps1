@@ -13,6 +13,14 @@
   This walker uses raw .NET APIs, skips reparse points, and uses the \\?\
   prefix so long node_modules paths are not silently dropped.
 
+  Two engines:
+    * mft  - parse the NTFS Master File Table directly (MftScan.cs). Reads the
+             whole volume in seconds. Requires administrator rights, an NTFS
+             volume, and a volume root as the -Root argument.
+    * walk - the directory walker above. Always available, needs no privileges,
+             works on any filesystem, roughly 50x slower.
+  `auto` (the default) tries mft and silently falls back to walk per root.
+
   This file MUST stay pure ASCII. PowerShell 5.1 parses .ps1 files as the
   system ANSI codepage when there is no BOM, so non-ASCII literals break it.
 #>
@@ -25,12 +33,18 @@ param(
     [int]$RecentDays = 45,
     [int]$RecentMinMB = 100,
     [int]$MaxBucket = 60,
+    [ValidateSet('auto', 'mft', 'walk')]
+    [string]$Engine = 'auto',
     [switch]$NoProgress
 )
 
 $ErrorActionPreference = 'Continue'
 $script:Prefix = '\\?\'
 $script:ErrCount = 0
+$script:MftReady = $false
+$script:MftError = ''
+$script:MftNotes = New-Object System.Collections.Generic.List[string]
+$skillRoot = Split-Path -Parent $PSScriptRoot
 
 function Get-AuditHome {
     if ($env:DISK_AUDIT_HOME -and $env:DISK_AUDIT_HOME.Trim() -ne '') {
@@ -190,10 +204,96 @@ function Invoke-RootScan {
 
     return [pscustomobject]@{
         root = $RootPath
+        engine = 'walk'
         totalMB = [math]::Round($total / 1MB, 0)
         files = $fileCount
         dirs = $dirCount
         buckets = $rows
+    }
+}
+
+# ---------------- MFT engine ----------------
+
+function Initialize-Mft {
+    if ($script:MftReady) { return $true }
+    if (-not ('DiskAudit.MftScanner' -as [type])) {
+        $cs = Join-Path $skillRoot 'scripts\MftScan.cs'
+        if (-not (Test-Path -LiteralPath $cs)) {
+            $script:MftError = 'MftScan.cs not found next to scan.ps1'
+            return $false
+        }
+        try {
+            Add-Type -Path $cs -ErrorAction Stop
+        }
+        catch {
+            $script:MftError = 'C# compiler failed: ' + $_.Exception.Message
+            return $false
+        }
+    }
+    $script:MftReady = $true
+    return $true
+}
+
+function Convert-MftFileTime([long]$ticks) {
+    if ($ticks -le 0) { return [datetime]::MinValue }
+    $max = [datetime]::MaxValue.ToFileTime()
+    if ($ticks -gt $max) { $ticks = $max }
+    try { return [datetime]::FromFileTime($ticks) } catch { return [datetime]::MinValue }
+}
+
+# Direct $MFT parse. Produces exactly the same shape as Invoke-RootScan.
+function Invoke-MftRootScan {
+    param(
+        [string]$RootPath,
+        [int]$Depth,
+        [int64]$BigThreshold,
+        [int64]$NotableFloor,
+        [int]$MaxBucket,
+        [System.Collections.Generic.List[object]]$BigFiles,
+        [System.Collections.Generic.List[object]]$NotableFiles
+    )
+
+    $letter = $RootPath.TrimEnd('\').TrimEnd(':')
+    $r = [DiskAudit.MftScanner]::Scan($letter, $Depth, $BigThreshold, $NotableFloor, $MaxBucket, 200000)
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($b in $r.Buckets) {
+        $rows.Add([pscustomobject]@{
+            root  = $RootPath
+            depth = [int]$b.Depth
+            path  = [string]$b.Path
+            mb    = [math]::Round([double]$b.Bytes / 1MB, 0)
+        })
+    }
+
+    foreach ($f in $r.NotableFiles) {
+        $dt = Convert-MftFileTime ([long]$f.MtimeTicks)
+        $mb = [math]::Round([double]$f.Bytes / 1MB, 1)
+        $NotableFiles.Add([pscustomobject]@{
+            path  = [string]$f.Path
+            mb    = $mb
+            mtime = $dt.ToString('yyyy-MM-dd HH:mm')
+        })
+    }
+    foreach ($f in $r.BigFiles) {
+        $dt = Convert-MftFileTime ([long]$f.MtimeTicks)
+        $BigFiles.Add([pscustomobject]@{
+            path  = [string]$f.Path
+            mb    = [math]::Round([double]$f.Bytes / 1MB, 1)
+            mtime = $dt.ToString('yyyy-MM-dd')
+        })
+    }
+
+    return [pscustomobject]@{
+        root = $RootPath
+        engine = 'mft'
+        totalMB = [math]::Round([double]$r.TotalBytes / 1MB, 0)
+        files = [int64]$r.Files
+        dirs = [int64]$r.Dirs
+        buckets = $rows
+        mftRecords = [int64]$r.RecordCount
+        mftHardLinkEntries = [int64]$r.HardLinkEntries
+        mftOrphans = [int64]$r.Orphans
     }
 }
 
@@ -220,11 +320,46 @@ $big = New-Object 'System.Collections.Generic.List[object]'
 $notable = New-Object 'System.Collections.Generic.List[object]'
 $rootResults = New-Object System.Collections.Generic.List[object]
 
+function Test-IsVolumeRoot([string]$p) {
+    return ($p -match '^[A-Za-z]:\\?$')
+}
+
 foreach ($r in $Root) {
     if (-not $NoProgress) { Write-Host ("scanning " + $r + " ...") }
-    $res = Invoke-RootScan -RootPath $r -Depth $Depth -BigThreshold $BigThreshold `
-                           -NotableFloor $NotableFloor -BigFiles $big -NotableFiles $notable
-    $rootResults.Add($res)
+    $done = $false
+
+    if ($Engine -eq 'mft' -or $Engine -eq 'auto') {
+        if (-not (Test-IsVolumeRoot $r)) {
+            $script:MftNotes.Add('MFT skipped for ' + $r + ': not a volume root (use walk)')
+        }
+        elseif (-not (Initialize-Mft)) {
+            $script:MftNotes.Add('MFT unavailable: ' + $script:MftError)
+        }
+        else {
+            try {
+                $res = Invoke-MftRootScan -RootPath $r -Depth $Depth -BigThreshold $BigThreshold `
+                                          -NotableFloor $NotableFloor -MaxBucket $MaxBucket `
+                                          -BigFiles $big -NotableFiles $notable
+                $rootResults.Add($res)
+                $done = $true
+            }
+            catch {
+                $msg = $_.Exception.Message
+                $inner = $_.Exception
+                while ($inner.InnerException) { $inner = $inner.InnerException }
+                if ($inner -and -not [object]::ReferenceEquals($inner, $_.Exception)) {
+                    $msg = $msg + ' | ' + $inner.Message
+                }
+                $script:MftNotes.Add('MFT failed on ' + $r + ': ' + $msg)
+            }
+        }
+    }
+
+    if (-not $done) {
+        $res = Invoke-RootScan -RootPath $r -Depth $Depth -BigThreshold $BigThreshold `
+                               -NotableFloor $NotableFloor -BigFiles $big -NotableFiles $notable
+        $rootResults.Add($res)
+    }
 }
 
 $recent = New-Object System.Collections.Generic.List[object]
@@ -245,10 +380,14 @@ foreach ($f in $notable) {
 
 $sw.Stop()
 
+$engineUsed = @($rootResults | ForEach-Object { $_.engine } | Sort-Object -Unique) -join '+'
+
 $doc = [pscustomobject]@{
     schema = 1
     scannedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     scanSeconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    engine = $engineUsed
+    engineNotes = @($script:MftNotes)
     host = $env:COMPUTERNAME
     user = $env:USERNAME
     depth = $Depth
@@ -269,4 +408,4 @@ Set-Content -LiteralPath $OutFile -Value $json -Encoding UTF8
 
 $grand = 0
 foreach ($r in $rootResults) { $grand += $r.totalMB }
-Write-Host ("RESULT " + $OutFile + " totalMB=" + $grand + " roots=" + $rootResults.Count + " seconds=" + [math]::Round($sw.Elapsed.TotalSeconds, 1))
+Write-Host ("RESULT " + $OutFile + " totalMB=" + $grand + " roots=" + $rootResults.Count + " engine=" + $engineUsed + " seconds=" + [math]::Round($sw.Elapsed.TotalSeconds, 1))

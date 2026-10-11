@@ -20,6 +20,9 @@
     T11 file rules read the `path` field and are not double counted
     T12 shipped rule files are structurally valid
     T13 growth comparison only matches snapshots sharing the root set and depth
+    T14 the engine a snapshot came from is reported and mismatches are flagged
+    T15 MFT engine: compiles, validates its root argument, sizes directories,
+        and agrees with the walker (skipped when the MFT is unavailable)
 
   This file MUST stay pure ASCII.
 #>
@@ -45,12 +48,22 @@ $testRules = Join-Path $skillRoot 'fixtures\test-rules.json'
 
 $pass = 0
 $fail = 0
+$skip = 0
 function Check([string]$name, [bool]$ok, [string]$detail) {
     if ($ok) { $script:pass++; Write-Host ('PASS  ' + $name) }
     else { $script:fail++; Write-Host ('FAIL  ' + $name + '  ::  ' + (($detail -replace "\s+", ' ').Trim())) }
 }
+function Skip([string]$name, [string]$why) {
+    $script:skip++; Write-Host ('SKIP  ' + $name + '  ::  ' + (($why -replace "\s+", ' ').Trim()))
+}
 function Get-Result([string]$out) {
-    $line = ($out -split "`n" | Where-Object { $_.Trim().StartsWith('RESULT ') } | Select-Object -First 1)
+    # analyze and scan both announce themselves with a RESULT line. Prefer the one
+    # carrying `findings=`, which only analyze emits, so a helper script's own
+    # RESULT line can never be mistaken for the stage result.
+    $all = @($out -split "`n" | Where-Object { $_.Trim().StartsWith('RESULT ') })
+    $line = $null
+    foreach ($c in $all) { if ($c -like '*findings=*') { $line = $c; break } }
+    if (-not $line -and $all.Count -gt 0) { $line = $all[0] }
     if ($line) { return $line.Trim() }
     return ''
 }
@@ -282,9 +295,167 @@ if (Test-Path -LiteralPath $an13bPath) {
     Check 'T13d no growth rows without a valid previous' (@($an13b.growth).Count -eq 0) ('growth=' + @($an13b.growth).Count)
 }
 
+# ---- T14 the engine a snapshot came from is reported, mismatches are flagged ----
+
+$engHome = Join-Path $tmp 'home-engine'
+$engHist = Join-Path $engHome 'history'
+New-Item -ItemType Directory -Force -Path $engHist | Out-Null
+
+# Snapshots written before the two engines existed carry no engine field at all,
+# so "" stands for "legacy, made by the walker".
+function New-EngineSnapshot([string]$name, [string]$engine, [string]$when, [int]$mb) {
+    $root = [pscustomobject]@{
+        root = 'C:\'; totalMB = $mb; files = 5; dirs = 3
+        buckets = @([pscustomobject]@{ root = 'C:\'; depth = 1; path = 'Users'; mb = $mb })
+    }
+    $doc = [pscustomobject]@{
+        schema = 1; scannedAt = $when; host = 'T'; user = 't'; depth = 1
+        thresholds = [pscustomobject]@{ minBigFileMB = 100; recentDays = 45; recentMinMB = 100 }
+        drives = @(); errorCount = 0; bigFiles = @(); recentBig = @()
+        roots = @($root)
+    }
+    if ($engine -ne '') { $doc | Add-Member -NotePropertyName engine -NotePropertyValue $engine }
+    $p = Join-Path $engHist $name
+    $doc | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $p -Encoding UTF8
+    return $p
+}
+
+function Get-Analyzed([string]$snapshot) {
+    $o = Invoke-Stage 'analyze.ps1' @{ Snapshot = $snapshot; RulesFile = $testRules } $engHome
+    $r = Get-Result $o
+    if ($r -eq '') { return $null }
+    $p = ($r -split ' ')[1]
+    if (-not (Test-Path -LiteralPath $p)) { return $null }
+    return (Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+# walk snapshot, then an MFT snapshot on top of it
+$null = New-EngineSnapshot 'scan-2026-03-01-10-00-00.json' '' '2026-03-01 10:00:00' 50000
+$pCmp = New-EngineSnapshot 'scan-2026-03-02-10-00-00.json' 'mft' '2026-03-02 10:00:00' 50400
+$aCmp = Get-Analyzed $pCmp
+Check 'T14a mixed engines are flagged as not comparable' ($aCmp -and $aCmp.comparison.engineMismatch -eq $true) ('mismatch=' + $aCmp.comparison.engineMismatch)
+Check 'T14b mismatch carries a reason code' ($aCmp -and $aCmp.comparison.noteCode -eq 'engine-mismatch') ('code=' + $aCmp.comparison.noteCode)
+Check 'T14c both engines are reported' ($aCmp -and $aCmp.comparison.engine -eq 'mft' -and $aCmp.comparison.previousEngine -eq 'walk') ('cur=' + $aCmp.comparison.engine + ' prev=' + $aCmp.comparison.previousEngine)
+Check 'T14d a legacy snapshot reads as the walker' ($aCmp -and $aCmp.comparison.previousEngine -eq 'walk') ('prev=' + $aCmp.comparison.previousEngine)
+Check 'T14e the disk wide delta is still reported' ($aCmp -and [int]$aCmp.comparison.totalDeltaMB -eq 400) ('delta=' + $aCmp.comparison.totalDeltaMB)
+
+# two MFT snapshots on top of each other must be comparable
+$pSame = New-EngineSnapshot 'scan-2026-03-03-10-00-00.json' 'mft' '2026-03-03 10:00:00' 50900
+$aSame = Get-Analyzed $pSame
+Check 'T14f same engine stays comparable' ($aSame -and $aSame.comparison.noteCode -eq 'comparable' -and $aSame.comparison.engineMismatch -eq $false) ('code=' + $aSame.comparison.noteCode)
+Check 'T14g a same engine delta is still produced' ($aSame -and [int]$aSame.comparison.totalDeltaMB -eq 500) ('delta=' + $aSame.comparison.totalDeltaMB)
+
+# a lone snapshot has nothing to compare against, which is not the same as no change
+$engHome2 = Join-Path $tmp 'home-engine2'
+$engHist2 = Join-Path $engHome2 'history'
+New-Item -ItemType Directory -Force -Path $engHist2 | Out-Null
+$pOne = Join-Path $engHist2 'scan-2026-03-04-10-00-00.json'
+Copy-Item $pCmp $pOne -Force
+$oOne = Invoke-Stage 'analyze.ps1' @{ Snapshot = $pOne; RulesFile = $testRules } $engHome2
+$rOne = Get-Result $oOne
+if ($rOne -ne '') {
+    $aOne = Get-Content -LiteralPath (($rOne -split ' ')[1]) -Raw -Encoding UTF8 | ConvertFrom-Json
+    Check 'T14h a lone snapshot reports no-previous' ($aOne.comparison.noteCode -eq 'no-previous') ('code=' + $aOne.comparison.noteCode)
+    Check 'T14i a lone snapshot has no growth rows' (@($aOne.growth).Count -eq 0) ('growth=' + @($aOne.growth).Count)
+    Check 'T14j a lone snapshot reports no previous total' ($null -eq $aOne.comparison.previousTotalMB) ('prev=' + $aOne.comparison.previousTotalMB)
+}
+
+# ---- T15 the MFT engine: compiles, validates arguments, sizes directories ----
+
+$mftOk = $false
+$mftWhy = ''
+$cs = Join-Path $skillRoot 'scripts\MftScan.cs'
+try {
+    if (-not ('DiskAudit.MftScanner' -as [type])) { Add-Type -Path $cs -ErrorAction Stop }
+    $mftOk = $true
+}
+catch { $mftWhy = $_.Exception.Message }
+Check 'T15a MftScan.cs compiles' $mftOk $mftWhy
+
+if ($mftOk) {
+    # a sub-directory is not a volume root
+    $badRoot = ''
+    try { [void][DiskAudit.MftScanner]::Scan('C:\Windows', 1, 100MB, 100MB, 5, 5) }
+    catch { $badRoot = $_.Exception.Message }
+    Check 'T15b a non-volume root is refused' ($badRoot -like '*volume root*') ('message=' + $badRoot)
+}
+
+# everything below needs administrator rights on an NTFS volume
+$isAdmin = $false
+try {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+catch { }
+
+$dsOut = Join-Path $tmp 'dirsizes.json'
+$dsPaths = Join-Path $tmp 'dirsizes-input.txt'
+# the 3 MB file written by T3 lives here, so its directory size is known exactly
+[System.IO.File]::WriteAllLines($dsPaths, [string[]]@($sizeRoot, (Join-Path $sizeRoot 'no-such-dir-here')), (New-Object System.Text.UTF8Encoding($false)))
+$oDs = Invoke-Stage 'dirsizes.ps1' @{ PathsFile = $dsPaths; OutFile = $dsOut; Engine = 'mft' } $auditHome
+
+if (-not $isAdmin) {
+    Skip 'T15c MFT dirsizes measures a known directory' 'needs administrator rights'
+    Skip 'T15d MFT dirsizes reports missing directories' 'needs administrator rights'
+}
+elseif (-not (Test-Path -LiteralPath $dsOut)) {
+    Check 'T15c MFT dirsizes measures a known directory' $false ('no output; ' + $oDs)
+}
+else {
+    $ds = Get-Content -LiteralPath $dsOut -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($ds.engine -ne 'mft') {
+        Skip 'T15c MFT dirsizes measures a known directory' ('engine=' + $ds.engine + ' ' + $ds.reason)
+        Skip 'T15d MFT dirsizes reports missing directories' ('engine=' + $ds.engine)
+    }
+    else {
+        $hit = @($ds.sizes | Where-Object { $_.path.TrimEnd('\') -ieq $sizeRoot.TrimEnd('\') })
+        $mb = -1
+        if ($hit.Count -gt 0) { $mb = [int][math]::Round([double]$hit[0].bytes / 1MB, 0) }
+        Check 'T15c MFT dirsizes measures a known directory' ($hit.Count -eq 1 -and $mb -eq 3) ('mb=' + $mb + ' hits=' + $hit.Count)
+        Check 'T15d missing directories are left out of the result' ([int]$ds.missing -ge 1 -and [int]$ds.found -eq 1) ('found=' + $ds.found + ' missing=' + $ds.missing)
+    }
+}
+
+# the opt out must be respected, so the caller can always force walking
+$dsOut2 = Join-Path $tmp 'dirsizes-walk.json'
+[void](Invoke-Stage 'dirsizes.ps1' @{ PathsFile = $dsPaths; OutFile = $dsOut2; Engine = 'walk' } $auditHome)
+if (Test-Path -LiteralPath $dsOut2) {
+    $ds2 = Get-Content -LiteralPath $dsOut2 -Raw -Encoding UTF8 | ConvertFrom-Json
+    Check 'T15e -Engine walk is honoured' ($ds2.engine -eq 'walk' -and @($ds2.sizes).Count -eq 0) ('engine=' + $ds2.engine)
+}
+else { Check 'T15e -Engine walk is honoured' $false 'no output file' }
+
+# both size engines must agree on WHICH findings exist, even when the numbers move
+$sizeHome = Join-Path $tmp 'home-size'
+$sizeHist = Join-Path $sizeHome 'history'
+New-Item -ItemType Directory -Force -Path $sizeHist | Out-Null
+Copy-Item (Join-Path $skillRoot 'fixtures\sample-history\*.json') $sizeHist -Force
+$sizesSeen = @()
+foreach ($eng in @('walk', 'mft')) {
+    $o = Invoke-Stage 'analyze.ps1' @{ Snapshot = $snapNew; RulesFile = $resRules; MinFindingMB = 0; SizeEngine = $eng } $sizeHome
+    $r = Get-Result $o
+    $p = ''
+    if ($r -ne '') { $p = ($r -split ' ')[1] }
+    if (Test-Path -LiteralPath $p) {
+        $d = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+        $ids = @($d.findings | ForEach-Object { $_.id })
+        $sizesSeen += [pscustomobject]@{ engine = $eng; ids = $ids; src = $d.sizeSource }
+    }
+}
+if ($isAdmin) {
+    Check 'T15f analyze records which size engine it used' ($sizesSeen.Count -eq 2 -and $sizesSeen[0].src -eq 'walk' -and $sizesSeen[1].src -eq 'mft') ('sources=' + (($sizesSeen | ForEach-Object { $_.src }) -join ','))
+}
+else {
+    Skip 'T15f analyze records which size engine it used' 'needs administrator rights'
+}
+Check 'T15g the size engine does not change which findings exist' (
+    $sizesSeen.Count -eq 2 -and
+    (($sizesSeen[0].ids | Sort-Object) -join '|') -eq (($sizesSeen[1].ids | Sort-Object) -join '|')) (
+    'walk=' + ($sizesSeen[0].ids -join ',') + ' mft=' + ($sizesSeen[1].ids -join ','))
+
 # ---- T10 ASCII guard ----
 $bad = @()
-foreach ($name in @('scan.ps1', 'analyze.ps1', 'clean.ps1', 'selftest.ps1')) {
+foreach ($name in @('scan.ps1', 'analyze.ps1', 'clean.ps1', 'selftest.ps1', 'dirsizes.ps1')) {
     $p = Join-Path $skillRoot ('scripts\' + $name)
     $b = [System.IO.File]::ReadAllBytes($p)
     foreach ($x in $b) { if ($x -gt 127) { $bad += $name; break } }
@@ -297,7 +468,7 @@ Pop-Location
 $env:DISK_AUDIT_HOME = $savedHome
 
 Write-Host ''
-Write-Host ('SELFTEST pass=' + $pass + ' fail=' + $fail + ' temp=' + $tmp)
+Write-Host ('SELFTEST pass=' + $pass + ' fail=' + $fail + ' skip=' + $skip + ' temp=' + $tmp)
 if ($fail -gt 0) { Write-Host 'RESULT-FAIL' } else { Write-Host 'RESULT-PASS' }
 if (-not $KeepTemp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 if ($fail -gt 0) { exit 1 }
