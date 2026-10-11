@@ -22,7 +22,9 @@
     T13 growth comparison only matches snapshots sharing the root set and depth
     T14 the engine a snapshot came from is reported and mismatches are flagged
     T15 MFT engine: compiles, validates its root argument, sizes directories,
+        honours -Engine walk and does not change which findings exist
         and agrees with the walker (skipped when the MFT is unavailable)
+    T16 a rule whose patterns overlap counts the shared folder only once
 
   This file MUST stay pure ASCII.
 #>
@@ -452,6 +454,61 @@ Check 'T15g the size engine does not change which findings exist' (
     $sizesSeen.Count -eq 2 -and
     (($sizesSeen[0].ids | Sort-Object) -join '|') -eq (($sizesSeen[1].ids | Sort-Object) -join '|')) (
     'walk=' + ($sizesSeen[0].ids -join ',') + ' mft=' + ($sizesSeen[1].ids -join ','))
+
+# ---- T16 one rule must not count the same folder twice ----
+# Two different patterns can resolve to the very same directory. The shipped
+# user-temp rule does exactly that (%TEMP% and %LOCALAPPDATA%\Temp are the same
+# folder on Windows) and used to report twice the folder's real size.
+$dupRules = Join-Path $tmp 'dup-rules.json'
+# Built outside the array literal on purpose: the comma operator binds tighter
+# than + in PowerShell, so @($alpha, $resRoot + '\al*') would parse as three
+# elements - $alpha, $resRoot and a literal '\al*' - and quietly measure the
+# parent directory too.
+$alphaGlob = $resRoot + '\al*'
+$dupDoc = [pscustomobject]@{
+    schema = 1
+    rules = @([pscustomobject]@{
+        id = 'dup-path-probe'; label = 'probe'; category = 'test'; risk = 'safe'
+        cleanMode = 'delete-dir'
+        paths = @($alpha, $alphaGlob)
+        cleanHint = 'probe'; why = 'probe'
+    })
+    fileRules = @()
+    anomaly = [pscustomobject]@{ cacheDirMB = 5120; anyDirMB = 25600 }
+}
+$dupDoc | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dupRules -Encoding UTF8
+$o16 = Invoke-Stage 'analyze.ps1' @{ Snapshot = $snapNew; RulesFile = $dupRules; MinFindingMB = 0 } $auditHome
+$r16 = Get-Result $o16
+$an16 = ''
+if ($r16 -ne '') { $an16 = ($r16 -split ' ')[1] }
+Check 'T16a a rule with overlapping patterns produced a finding' ($an16 -ne '') $o16
+if (Test-Path -LiteralPath $an16) {
+    $d16 = Get-Content -LiteralPath $an16 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $f16 = @($d16.findings)[0]
+    Check 'T16b the shared folder is counted once (2MB, not 4MB)' ($f16 -and [int]$f16.mb -eq 2) ('mb=' + $f16.mb)
+    Check 'T16c matchCount reports the folder once' ($f16 -and [int]$f16.matchCount -eq 1) ('matchCount=' + $f16.matchCount)
+}
+
+# The shipped rules must not carry the same trap. T16d runs them against the real
+# filesystem and rejects any finding whose matches name one folder twice - that
+# would inflate both the finding and the reclaimable total.
+$o16b = Invoke-Stage 'analyze.ps1' @{ Snapshot = $snapNew; MinFindingMB = 0 } $auditHome
+$r16b = Get-Result $o16b
+$an16b = ''
+if ($r16b -ne '') { $an16b = ($r16b -split ' ')[1] }
+if (Test-Path -LiteralPath $an16b) {
+    $d16b = Get-Content -LiteralPath $an16b -Raw -Encoding UTF8 | ConvertFrom-Json
+    $dupes = @()
+    foreach ($fx in $d16b.findings) {
+        $keys = @($fx.matches | ForEach-Object { ([string]$_.path).TrimEnd('\').ToLowerInvariant() })
+        if (@($keys | Sort-Object -Unique).Count -ne $keys.Count) { $dupes += $fx.id }
+    }
+    Check 'T16d no shipped finding counts one folder twice' ($dupes.Count -eq 0) ('duplicated in: ' + ($dupes -join ','))
+    Write-Host ('      (T16d checked ' + @($d16b.findings).Count + ' findings from the shipped rules)')
+}
+else {
+    Check 'T16d no shipped finding counts one folder twice' $false 'no analysis output'
+}
 
 # ---- T10 ASCII guard ----
 $bad = @()

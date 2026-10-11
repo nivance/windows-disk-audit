@@ -75,7 +75,7 @@ C 盘从"还剩 50 GB"到"飘红"，通常是无声发生的。已有的工具�
 | **异常膨胀检测** | 单个缓存类目录 > 5 GB 直接标红。**这是挖出"隐形大户"的关键** —— 纯看总量发现不了它 |
 | **默认进回收站** | 用 `SHFileOperation` + `FOF_ALLOWUNDO`，误删可从回收站找回 |
 | **零依赖** | 只需系统自带的 PowerShell 5.1+，无需任何运行时 |
-| **自带回归测试** | 55 项断言，1 分钟跑完，全部在临时目录内运行，不碰真实数据；缺管理员权限时 MFT 断言报 SKIP 而非 FAIL |
+| **自带回归测试** | 59 项断言，1 分钟跑完，全部在临时目录内运行，不碰真实数据；缺管理员权限时 MFT 断言报 SKIP 而非 FAIL |
 
 ## 快速开始
 
@@ -200,7 +200,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径定向测尺：一次 $MFT 解析量出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，Add-Type 就地编译，无外部依赖）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 55 项回归断言
+│   └── selftest.ps1       # 59 项回归断言
 ├── rules/
 │   ├── caches.json        # 可清理规则库（36 条目录规则 + 5 条文件名规则）
 │   └── never-touch.json   # 红线目录，clean.ps1 的硬校验依据
@@ -241,7 +241,7 @@ windows-disk-audit/
 
 ```powershell
 & "$S\scripts\selftest.ps1"     # 约 1 分钟
-# 末行：SELFTEST pass=55 fail=0 skip=0 / RESULT-PASS
+# 末行：SELFTEST pass=59 fail=0 skip=0 / RESULT-PASS
 ```
 
 覆盖：增长对比与 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性（对已知 3 MB 文件）、System32 必须被拒绝、盘符根子目录必须被拒绝、批量上限、dry-run 零删除、无 `-Confirmed` 不动手、规则通配符解析、文件名规则去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合。
@@ -271,4 +271,4 @@ On NTFS it parses the Master File Table directly, so a full-volume scan of 1.4 m
 
 Cleanup is optional and deliberately conservative: nothing is ever deleted during collection, every single path must be confirmed explicitly (`-Confirmed`), deletions go to the Recycle Bin, at most 10 items per batch, and system-critical paths are refused outright.
 
-Run `scripts/selftest.ps1` for the 55-assertion regression suite.
+Run `scripts/selftest.ps1` for the 59-assertion regression suite.

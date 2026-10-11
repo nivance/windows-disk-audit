@@ -41,7 +41,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径的定向测尺：一次 $MFT 解析给出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，由 scan.ps1 / dirsizes.ps1 用 Add-Type 编译）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 自检：55 项断言，全在临时目录里跑，不碰真实数据
+│   └── selftest.ps1       # 自检：59 项断言，全在临时目录里跑，不碰真实数据
 ├── references/
 │   └── report-format.md   # 对话内报告模板
 └── fixtures/
@@ -185,6 +185,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | 不要把宿主 stdout 交给子脚本 | 子脚本的 `RESULT` 行会污染调用方的输出（analyze 调 dirsizes 时用子进程 + 丢弃输出） |
 | `@($genericList)` 是雷 | 在 `[pscustomobject]@{...}` 里用 `@($list)` 包住泛型 List 会让转换抛 `ArgumentException: 参数类型不匹配`（PS 5.1）。改用 `$list.ToArray()` |
 | 不要用 `$home` 当普通变量 | `$home` 是只读自动变量，赋值会静默失败，导致路径写错地方 |
+| 一条规则内的多个 pattern 可能命中同一目录 | `%TEMP%` 与 `%LOCALAPPDATA%\Temp` 在 Windows 上就是同一个目录。analyze 在**规则内**按规范化路径去重；不去重的话该 finding 的体积和 `matchCount` 都会翻倍（shipped 的 `user-temp` 曾把 1,596 MB 的 Temp 报成 3,192 MB）。规则文件保留两条是对的 —— `%TEMP%` 被重定向时二者确实是两个目录，所以要在代码里去重而不是删规则 |
+| 数组字面量里的 `+` 会被逗号抢先 | `@($a, $b + '\x*')` 在 PowerShell 里解析成**三个**元素（`, ` 优先级高于 `+`），会静默多测一个父目录。拼接字符串先赋给变量再放进数组 |
 
 ## 验证方式
 
@@ -194,9 +196,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 & "$S\scripts\selftest.ps1"
 ```
 
-末行输出 `SELFTEST pass=55 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
+末行输出 `SELFTEST pass=59 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
 
-覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合。
+覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）。
 
 改动脚本后至少跑一次「全新环境」验证：
 

@@ -207,8 +207,16 @@ $resolvedByRule = New-Object System.Collections.Generic.List[object]
 $wantDirs = New-Object System.Collections.Generic.List[string]
 foreach ($rule in $ruleList) {
     $resolved = New-Object System.Collections.Generic.List[object]
+    # Two patterns inside one rule can resolve to the very same folder: %TEMP%
+    # and %LOCALAPPDATA%\Temp are the same directory on Windows. Both would land
+    # in $resolved, and summing them would double the finding's size and its
+    # match count - the shipped user-temp rule used to report 3,192 MB for a
+    # 1,596 MB Temp folder. Keying on the normalised path counts each folder
+    # once, per rule.
+    $seenInRule = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($pat in $rule.paths) {
         foreach ($r in (Resolve-Pattern $pat)) {
+            if (-not $seenInRule.Add(([string]$r).TrimEnd('\').ToLowerInvariant())) { continue }
             $isFile = $false
             try { $isFile = [System.IO.File]::Exists((Add-Prefix $r)) } catch { $isFile = $false }
             $resolved.Add([pscustomobject]@{ path = $r; isFile = $isFile })
