@@ -22,6 +22,7 @@ agent_created: true
 ```
 windows-disk-audit/
 ├── SKILL.md
+├── README.md              # 面向 GitHub 的项目说明
 ├── rules/
 │   ├── caches.json        # 可清理规则库（含 risk / category / cleanHint）
 │   └── never-touch.json   # 红线目录，clean.ps1 的硬校验依据
