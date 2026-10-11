@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "updatedAt": "2026-10-11",
+  "notes": [
+    "空规则集，仅供 selftest.ps1 做与真实磁盘无关的回归测试。",
+    "用它可以验证「采集 -> 归因 -> 增长对比」的链路，而不依赖机器上实际存在哪些缓存目录。"
+  ],
+  "rules": [],
+  "fileRules": [],
+  "anomaly": {
+    "cacheDirMB": 5120,
+    "anyDirMB": 25600,
+    "note": "selftest 用"
+  }
+}

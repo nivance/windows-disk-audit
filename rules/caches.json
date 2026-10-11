@@ -1,0 +1,496 @@
+{
+  "schema": 1,
+  "updatedAt": "2026-10-11",
+  "notes": [
+    "paths 支持 %ENVVAR% 展开与单段通配符 *（只匹配一层目录名）",
+    "cleanMode: delete-dir=整目录删除 | purge-contents=清空内容保留目录 | command=需执行命令 | manual=需在应用内操作",
+    "risk: safe=删了只是首次稍慢 | caution=需用户确认（可能是数据或影响功能） | never=禁止删除"
+  ],
+  "rules": [
+    {
+      "id": "chrome-service-worker",
+      "label": "Chrome 站点缓存 (Service Worker)",
+      "category": "browser-cache",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": ["%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Service Worker"],
+      "cleanHint": "先完全退出 Chrome（含后台常驻），再删除该目录",
+      "why": "PWA 站点缓存无容量上限且从不回收，是单目录最大膨胀源"
+    },
+    {
+      "id": "chrome-cache",
+      "label": "Chrome 页面/代码缓存",
+      "category": "browser-cache",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Cache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Code Cache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\GPUCache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\GrShaderCache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\ShaderCache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\DawnGraphiteCache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\DawnWebGPUCache"
+      ],
+      "cleanHint": "退出 Chrome 后删除",
+      "why": "可重建的页面与着色器缓存"
+    },
+    {
+      "id": "chrome-crx-cache",
+      "label": "Chrome 扩展下载缓存",
+      "category": "browser-cache",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\component_crx_cache",
+        "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\extensions_crx_cache",
+        "%LOCALAPPDATA%\\Google\\GoogleUpdater\\crx_cache"
+      ],
+      "cleanHint": "退出 Chrome 后删除",
+      "why": "组件/扩展安装包的下载缓存"
+    },
+    {
+      "id": "edge-cache",
+      "label": "Edge 页面缓存",
+      "category": "browser-cache",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Cache",
+        "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Code Cache",
+        "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Service Worker"
+      ],
+      "cleanHint": "退出 Edge 后删除",
+      "why": "可重建的页面缓存"
+    },
+    {
+      "id": "electron-app-cache",
+      "label": "Electron 应用缓存（Trae/WorkBuddy/orca/VSCode 等）",
+      "category": "app-cache",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%APPDATA%\\Trae\\Cache",
+        "%APPDATA%\\Trae\\CachedData",
+        "%APPDATA%\\Trae\\GPUCache",
+        "%APPDATA%\\WorkBuddy\\Cache",
+        "%APPDATA%\\WorkBuddy\\CachedData",
+        "%APPDATA%\\WorkBuddy\\GPUCache",
+        "%APPDATA%\\orca\\Cache",
+        "%APPDATA%\\orca\\GPUCache",
+        "%APPDATA%\\orca\\Code Cache",
+        "%APPDATA%\\Code\\Cache",
+        "%APPDATA%\\Code\\CachedData",
+        "%APPDATA%\\obsidian\\Cache",
+        "%APPDATA%\\Logseq\\.cache"
+      ],
+      "cleanHint": "退出对应应用后删除",
+      "why": "Electron 的 V8 代码缓存，各应用各占数百 MB"
+    },
+    {
+      "id": "npm-cache",
+      "label": "npm 包缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "command",
+      "paths": ["%LOCALAPPDATA%\\npm-cache"],
+      "command": "npm cache clean --force",
+      "cleanHint": "或直接删除该目录",
+      "why": "所有下载过的包都在这里留档，只增不减"
+    },
+    {
+      "id": "pnpm-cache",
+      "label": "pnpm 存储与缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "command",
+      "paths": ["%LOCALAPPDATA%\\pnpm\\store", "%LOCALAPPDATA%\\pnpm-cache"],
+      "command": "pnpm store prune",
+      "cleanHint": "或直接删除该目录",
+      "why": "硬链接仓库里会积累大量已不再被引用的包"
+    },
+    {
+      "id": "pip-cache",
+      "label": "pip 包缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "command",
+      "paths": ["%LOCALAPPDATA%\\pip", "%APPDATA%\\pip"],
+      "command": "pip cache purge",
+      "cleanHint": "或直接删除该目录",
+      "why": "wheel 与 http 缓存"
+    },
+    {
+      "id": "uv-cache",
+      "label": "uv 包缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "command",
+      "paths": ["%LOCALAPPDATA%\\uv", "%APPDATA%\\uv"],
+      "command": "uv cache clean",
+      "cleanHint": "或直接删除该目录",
+      "why": "uv 的下载与构建缓存"
+    },
+    {
+      "id": "yarn-cache",
+      "label": "Yarn 包缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": ["%LOCALAPPDATA%\\Yarn\\Cache", "%USERPROFILE%\\.yarn\\berry\\cache"],
+      "cleanHint": "直接删除",
+      "why": "已下载的包归档"
+    },
+    {
+      "id": "bun-cache",
+      "label": "Bun 安装缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": ["%USERPROFILE%\\.bun\\install\\cache"],
+      "cleanHint": "直接删除",
+      "why": "bun 包缓存"
+    },
+    {
+      "id": "nuget-cache",
+      "label": "NuGet 包缓存",
+      "category": "package-manager",
+      "risk": "caution",
+      "cleanMode": "command",
+      "paths": ["%USERPROFILE%\\.nuget\\packages"],
+      "command": "dotnet nuget locals all --clear",
+      "cleanHint": "建议用命令清理，直接删会让下次构建重新还原",
+      "why": "本地包仓库，删后首次构建变慢"
+    },
+    {
+      "id": "gradle-cache",
+      "label": "Gradle 缓存",
+      "category": "package-manager",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": ["%USERPROFILE%\\.gradle\\caches", "%USERPROFILE%\\.gradle\\wrapper\\dists"],
+      "cleanHint": "删后下次构建需重新下载",
+      "why": "构建依赖与 wrapper 发行包，可累积数 GB"
+    },
+    {
+      "id": "maven-repo",
+      "label": "Maven 本地仓库",
+      "category": "package-manager",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": ["%USERPROFILE%\\.m2\\repository"],
+      "cleanHint": "删后下次构建需重新下载依赖",
+      "why": "本地依赖仓库"
+    },
+    {
+      "id": "conda-pkgs",
+      "label": "Conda 包缓存",
+      "category": "package-manager",
+      "risk": "caution",
+      "cleanMode": "command",
+      "paths": ["%USERPROFILE%\\.conda\\pkgs", "%USERPROFILE%\\anaconda3\\pkgs", "%USERPROFILE%\\miniconda3\\pkgs"],
+      "command": "conda clean --all -y",
+      "cleanHint": "建议用 conda clean",
+      "why": "解压后的包副本会长期堆积"
+    },
+    {
+      "id": "go-build-cache",
+      "label": "Go 构建缓存",
+      "category": "package-manager",
+      "risk": "safe",
+      "cleanMode": "command",
+      "paths": ["%LOCALAPPDATA%\\go-build", "%USERPROFILE%\\AppData\\Local\\go-build"],
+      "command": "go clean -cache",
+      "cleanHint": "或直接删除",
+      "why": "编译产物缓存"
+    },
+    {
+      "id": "browser-automation-browsers",
+      "label": "Playwright/Puppeteer 下载的浏览器内核",
+      "category": "dev-tool",
+      "risk": "caution",
+      "cleanMode": "command",
+      "paths": [
+        "%LOCALAPPDATA%\\ms-playwright",
+        "%USERPROFILE%\\.cache\\puppeteer",
+        "%USERPROFILE%\\.chromium-browser-snapshots"
+      ],
+      "command": "npx playwright uninstall --all",
+      "cleanHint": "删除后浏览器自动化脚本需要重新安装内核",
+      "why": "每个内核 100-300 MB，多版本共存会累积上 GB"
+    },
+    {
+      "id": "devtools-mcp-profile",
+      "label": "Chrome DevTools MCP 浏览器配置",
+      "category": "dev-tool",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": ["%USERPROFILE%\\.cache\\chrome-devtools-mcp"],
+      "cleanHint": "直接删除",
+      "why": "MCP 专用浏览器实例的临时 profile"
+    },
+    {
+      "id": "user-temp",
+      "label": "用户临时目录",
+      "category": "temp",
+      "risk": "safe",
+      "cleanMode": "purge-contents",
+      "paths": ["%TEMP%", "%LOCALAPPDATA%\\Temp"],
+      "cleanHint": "清空内容但保留目录本身；被占用的文件自动跳过",
+      "why": "临时文件默认不清理，会长期堆积"
+    },
+    {
+      "id": "windows-temp",
+      "label": "系统临时目录",
+      "category": "temp",
+      "risk": "safe",
+      "cleanMode": "purge-contents",
+      "paths": ["%WINDIR%\\Temp"],
+      "cleanHint": "清空内容但保留目录本身",
+      "why": "系统级临时文件"
+    },
+    {
+      "id": "crash-dumps",
+      "label": "崩溃转储",
+      "category": "log",
+      "risk": "safe",
+      "cleanMode": "purge-contents",
+      "paths": ["%LOCALAPPDATA%\\CrashDumps", "%PROGRAMDATA%\\Microsoft\\Windows\\WER"],
+      "cleanHint": "清空内容",
+      "why": "程序崩溃时的内存转储，单个可达数百 MB"
+    },
+    {
+      "id": "windows-logs",
+      "label": "Windows 日志目录",
+      "category": "log",
+      "risk": "safe",
+      "cleanMode": "purge-contents",
+      "paths": ["%WINDIR%\\Logs", "%WINDIR%\\Panther"],
+      "cleanHint": "清空内容",
+      "why": "安装与组件日志"
+    },
+    {
+      "id": "windows-update-download",
+      "label": "Windows 更新下载缓存",
+      "category": "system-cache",
+      "risk": "caution",
+      "cleanMode": "command",
+      "paths": ["%WINDIR%\\SoftwareDistribution\\Download"],
+      "command": "net stop wuauserv & net stop bits & rmdir /s /q \"%WINDIR%\\SoftwareDistribution\\Download\" & net start wuauserv & net start bits",
+      "cleanHint": "需管理员权限，且必须先停服务",
+      "why": "已安装更新的安装包残留"
+    },
+    {
+      "id": "recycle-bin",
+      "label": "回收站",
+      "category": "system-cache",
+      "risk": "safe",
+      "cleanMode": "purge-contents",
+      "paths": ["%SYSTEMDRIVE%\\$Recycle.Bin"],
+      "cleanHint": "权限不足时用『清空回收站』代替",
+      "why": "删除的文件仍占用空间"
+    },
+    {
+      "id": "windows-old",
+      "label": "旧系统备份 Windows.old",
+      "category": "system-cache",
+      "risk": "caution",
+      "cleanMode": "command",
+      "paths": ["%SYSTEMDRIVE%\\Windows.old"],
+      "command": "cleanmgr /sageset:1  （或 设置 > 系统 > 存储 > 临时文件 > 以前的 Windows 安装）",
+      "cleanHint": "升级后 10 天内可回滚，之后建议清理，通常可释放 5-20 GB",
+      "why": "系统升级保留的完整旧系统副本"
+    },
+    {
+      "id": "winsxs-cleanup",
+      "label": "WinSxS 组件存储（禁止手删）",
+      "category": "system",
+      "risk": "never",
+      "cleanMode": "command",
+      "paths": ["%WINDIR%\\WinSxS"],
+      "command": "DISM /Online /Cleanup-Image /StartComponentCleanup",
+      "cleanHint": "只能用 DISM，手工删除会损坏系统。通常可回收 1-3 GB",
+      "why": "目录用硬链接与 System32 共享文件，显示体积远大于真实占用"
+    },
+    {
+      "id": "im-cache-feishu",
+      "label": "飞书 / Lark 缓存",
+      "category": "im-cache",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%APPDATA%\\LarkShell\\sdk_storage",
+        "%APPDATA%\\LarkShell\\sandbox_runtime\\downloads",
+        "%APPDATA%\\LarkShell\\CodeCache",
+        "%APPDATA%\\LarkShell\\GrShaderCache",
+        "%APPDATA%\\Lark\\Cache",
+        "%LOCALAPPDATA%\\Lark\\Cache"
+      ],
+      "cleanHint": "需退出飞书；sdk_storage 含搜索索引与离线文件缓存，删除后需重新同步",
+      "why": "离线文件与搜索索引长期累积"
+    },
+    {
+      "id": "im-cache-wechat",
+      "label": "微信 / 企业微信日志与缓存",
+      "category": "im-cache",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%APPDATA%\\Tencent\\xwechat\\log",
+        "%APPDATA%\\Tencent\\xwechat\\crashinfo",
+        "%APPDATA%\\Tencent\\xwechat\\radium\\Cache"
+      ],
+      "cleanHint": "需退出微信；聊天记录与文件不要删",
+      "why": "日志与渲染缓存"
+    },
+    {
+      "id": "im-cache-dingtalk",
+      "label": "钉钉缓存",
+      "category": "im-cache",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": ["%APPDATA%\\DingTalk\\*\\Cache", "%LOCALAPPDATA%\\DingTalk_*\\Cache"],
+      "cleanHint": "需退出钉钉",
+      "why": "消息与文件缓存"
+    },
+    {
+      "id": "office-cache-wps",
+      "label": "WPS 插件与缓存",
+      "category": "office-cache",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": ["%APPDATA%\\kingsoft\\wps\\addons", "%APPDATA%\\kingsoft\\office6\\cache", "%APPDATA%\\kingsoft\\office6\\backup"],
+      "cleanHint": "addons 是功能插件，删除会导致部分云功能需重新下载",
+      "why": "插件包与文档缓存"
+    },
+    {
+      "id": "ai-cli-sessions",
+      "label": "AI 编程助手会话记录",
+      "category": "ai-session",
+      "risk": "caution",
+      "cleanMode": "delete-dir",
+      "paths": [
+        "%USERPROFILE%\\.codex\\sessions",
+        "%USERPROFILE%\\.codex\\archived_sessions",
+        "%USERPROFILE%\\.codex\\.tmp",
+        "%USERPROFILE%\\.codex\\generated_images",
+        "%USERPROFILE%\\.claude\\projects",
+        "%USERPROFILE%\\.cursor\\logs",
+        "%APPDATA%\\orca\\codex-runtime-home\\home\\sessions"
+      ],
+      "cleanHint": "这是对话历史，删除后无法恢复，请先确认是否需要留存",
+      "why": "单个 rollout 会话文件可达 1 GB 以上"
+    },
+    {
+      "id": "ai-generated-docs",
+      "label": "AI 助手输出的文档目录",
+      "category": "ai-session",
+      "risk": "caution",
+      "cleanMode": "manual",
+      "paths": ["%USERPROFILE%\\Documents\\Codex", "%USERPROFILE%\\Documents\\ChatGPT"],
+      "cleanHint": "是你自己的产出物，且位于受保护的文档目录内，clean.ps1 不会自动处理；请先挑走要留的再手动清理",
+      "why": "按日期累积的生成文件"
+    },
+    {
+      "id": "workbuddy-logs",
+      "label": "WorkBuddy 运行日志",
+      "category": "log",
+      "risk": "safe",
+      "cleanMode": "delete-dir",
+      "paths": ["%USERPROFILE%\\.workbuddy\\logs", "%USERPROFILE%\\.workbuddy\\traces"],
+      "cleanHint": "删除过期的日期目录即可，含 expired-* 标记的可直接删",
+      "why": "按天累积的日志与追踪文件"
+    },
+    {
+      "id": "skill-duplicate",
+      "label": "重复存放的 skill 副本",
+      "category": "dev-tool",
+      "risk": "caution",
+      "cleanMode": "manual",
+      "paths": ["%USERPROFILE%\\.agents\\skills", "%USERPROFILE%\\.claude\\skills"],
+      "cleanHint": "需人工比对哪一份是实际生效的，再删多余副本",
+      "why": "同一 skill 可能在多套 agent 目录下各存一份"
+    },
+    {
+      "id": "node-modules-stale",
+      "label": "长期未动的项目 node_modules",
+      "category": "dev-tool",
+      "risk": "caution",
+      "cleanMode": "manual",
+      "paths": ["%USERPROFILE%\\orca\\workspaces", "%USERPROFILE%\\code", "%USERPROFILE%\\projects"],
+      "cleanHint": "按项目确认是否还在用；删除后需重新 npm install",
+      "why": "每个 node_modules 通常数百 MB 到数 GB"
+    },
+    {
+      "id": "app-updater-cache",
+      "label": "应用更新器缓存与残留安装包",
+      "category": "installer",
+      "risk": "safe",
+      "cleanMode": "purge-contents",
+      "paths": [
+        "%LOCALAPPDATA%\\ima.copilot\\User Data\\reshub",
+        "%LOCALAPPDATA%\\Tabbit\\TabbitUpdater\\crx_cache",
+        "%LOCALAPPDATA%\\GitHubDesktop\\packages"
+      ],
+      "cleanHint": "清空内容，应用下次更新会重新下载",
+      "why": "下载完就没人再用的安装包"
+    }
+  ],
+  "fileRules": [
+    {
+      "id": "installer-leftover",
+      "label": "安装包残留（installer / setup / nupkg / msi）",
+      "category": "installer",
+      "risk": "caution",
+      "match": "\\\\(installer|setup|update|Installer)\\.(exe|msi)$|\\.nupkg$|\\.appx$",
+      "minMB": 100,
+      "cleanHint": "逐个确认后删除，注意区分「已装完的残留」与「正在用的安装包」",
+      "why": "安装完成后不再需要的安装包"
+    },
+    {
+      "id": "disk-image",
+      "label": "虚拟磁盘镜像（vhd / vhdx / vmdk / iso）",
+      "category": "vm",
+      "risk": "caution",
+      "match": "\\.(vhd|vhdx|vmdk|vdi|iso|img)$",
+      "minMB": 500,
+      "cleanHint": "不要删除，建议迁移到其他磁盘或压缩；删除会导致虚拟机/WSL 无法启动",
+      "why": "虚拟机 / WSL / 镜像文件，通常可迁移到其他盘"
+    },
+    {
+      "id": "huge-log",
+      "label": "超大日志文件",
+      "category": "log",
+      "risk": "caution",
+      "match": "\\.(log|jsonl|trace|etl|dmp)$",
+      "minMB": 200,
+      "cleanHint": "先确认是否仍被进程写入；可直接清空内容而非删除文件",
+      "why": "日志文件通常可直接清空，但要先确认是否还在写入"
+    },
+    {
+      "id": "sqlite-history",
+      "label": "历史记录数据库（sqlite）",
+      "category": "ai-session",
+      "risk": "caution",
+      "match": "\\.(sqlite|db|sqlite3)$",
+      "minMB": 200,
+      "cleanHint": "多为对话/索引历史，删除不可恢复；先确认是否需要留存",
+      "why": "对话/索引历史，多为只增不减"
+    },
+    {
+      "id": "editor-sdk-binary",
+      "label": "打包在应用内的运行时二进制",
+      "category": "app-runtime",
+      "risk": "never",
+      "match": "\\.asar$|\\.node$|editor_sdk\\.exe$",
+      "minMB": 100,
+      "cleanHint": "禁止删除。属于已安装程序本体，删了应用会直接打不开",
+      "why": "属于已安装程序本体，删除会破坏应用"
+    }
+  ],
+  "anomaly": {
+    "cacheDirMB": 5120,
+    "anyDirMB": 25600,
+    "note": "单个缓存类目录超过 cacheDirMB 即视为异常膨胀；单个普通目录超过 anyDirMB 提示人工确认"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "scannedAt": "2026-01-01 09:00:00",
+  "scanSeconds": 12.4,
+  "host": "TESTBOX",
+  "user": "tester",
+  "depth": 3,
+  "thresholds": { "minBigFileMB": 300, "recentDays": 45, "recentMinMB": 100 },
+  "drives": [
+    { "mount": "C:", "label": "System", "fileSystem": "NTFS", "totalMB": 163840, "freeMB": 40960, "usedMB": 122880, "usedPct": 75 }
+  ],
+  "roots": [
+    {
+      "root": "C:\\",
+      "totalMB": 122000,
+      "files": 4210,
+      "dirs": 380,
+      "buckets": [
+        { "root": "C:\\", "depth": 1, "path": "Users", "mb": 80000 },
+        { "root": "C:\\", "depth": 1, "path": "Windows", "mb": 30000 },
+        { "root": "C:\\", "depth": 1, "path": "Program Files", "mb": 9000 },
+        { "root": "C:\\", "depth": 1, "path": "ProgramData", "mb": 2500 },
+        { "root": "C:\\", "depth": 2, "path": "Users\\tester", "mb": 79900 },
+        { "root": "C:\\", "depth": 2, "path": "Users\\tester\\AppData", "mb": 60000 },
+        { "root": "C:\\", "depth": 3, "path": "Users\\tester\\AppData\\Local", "mb": 45000 },
+        { "root": "C:\\", "depth": 3, "path": "Users\\tester\\AppData\\Roaming", "mb": 15000 }
+      ]
+    }
+  ],
+  "bigFiles": [
+    { "path": "C:\\Users\\tester\\Downloads\\installer.exe", "mb": 800, "mtime": "2025-12-28" },
+    { "path": "C:\\Program Files\\WindowsApps\\Demo\\app.asar", "mb": 541, "mtime": "2025-12-20" }
+  ],
+  "recentBig": [
+    { "path": "C:\\Users\\tester\\Downloads\\installer.exe", "mb": 800, "mtime": "2025-12-28 11:20" },
+    { "path": "C:\\Users\\tester\\AppData\\Local\\Temp\\dump.dmp", "mb": 320, "mtime": "2025-12-31 08:02" }
+  ],
+  "errorCount": 3
+}
