@@ -546,15 +546,146 @@ foreach ($r in $snap.roots) {
     }
 }
 
+# ---------------- findings must not nest ----------------
+#
+# Rules are evaluated independently, so two findings can describe the same
+# bytes: `huge-log` sizes individual log files that sit inside a directory
+# already sized by `ai-cli-sessions`. Both are true statements, but adding them
+# together counts that space twice and the "reclaimable" total becomes a number
+# no one can cash in.
+#
+# Fix: a match counts only if no *delete-capable* match from another finding
+# contains it. The parent's clean mode is the deciding factor - a delete-dir or
+# purge-contents parent really does take the whole subtree with it, so the child
+# is already paid for. A manual or command parent does not promise that, so its
+# children keep counting (under-reporting is worse than double-reporting: it
+# makes the tool promise space it cannot deliver).
+$deleteModes = @('delete-dir', 'purge-contents')
+$allMatches = New-Object System.Collections.Generic.List[object]
+foreach ($f in $findings) {
+    foreach ($m in $f.matches) {
+        $allMatches.Add([pscustomobject]@{
+            key  = ([string]$f.id + '||' + ([string]$m.path).TrimEnd('\').ToLowerInvariant())
+            id   = [string]$f.id
+            mode = [string]$f.cleanMode
+            norm = ([string]$m.path).TrimEnd('\').ToLowerInvariant()
+            mb   = [double]$m.mb
+        })
+    }
+}
+
+$coveredBy = @{}
+foreach ($m in $allMatches) {
+    $bestId = ''
+    $bestLen = -1
+    foreach ($o in $allMatches) {
+        if ($o.key -eq $m.key) { continue }
+        # Matches of the same finding were already de-duplicated when the rule
+        # was resolved; comparing them here would just subtract a finding from
+        # itself.
+        if ($o.id -eq $m.id) { continue }
+        if ($deleteModes -notcontains $o.mode) { continue }
+        if (-not $m.norm.StartsWith($o.norm + '\')) { continue }
+        # The tightest containing match wins, so a finding is never credited to
+        # a parent that is itself contained in something else.
+        if ($o.norm.Length -gt $bestLen) { $bestLen = $o.norm.Length; $bestId = $o.id }
+    }
+    if ($bestId -ne '') { $coveredBy[$m.key] = $bestId }
+}
+
+$overlapMB = 0
+$overlapPairs = 0
+$overlapEdges = New-Object System.Collections.Generic.List[object]
+foreach ($f in $findings) {
+    $covMB = 0
+    $covCount = 0
+    $parents = @{}
+    foreach ($m in $f.matches) {
+        $k = ([string]$f.id + '||' + ([string]$m.path).TrimEnd('\').ToLowerInvariant())
+        if ($coveredBy.ContainsKey($k)) {
+            $covMB += [double]$m.mb
+            $covCount++
+            $pid2 = $coveredBy[$k]
+            if (-not $parents.ContainsKey($pid2)) { $parents[$pid2] = 0 }
+            $parents[$pid2] = $parents[$pid2] + [double]$m.mb
+        }
+    }
+    $eff = [double]$f.mb - $covMB
+    if ($eff -lt 0) { $eff = 0 }
+    $f | Add-Member -NotePropertyName effectiveMB -NotePropertyValue ([math]::Round($eff, 0)) -Force
+    $f | Add-Member -NotePropertyName coveredMB -NotePropertyValue ([math]::Round($covMB, 0)) -Force
+    $f | Add-Member -NotePropertyName coveredCount -NotePropertyValue $covCount -Force
+    $f | Add-Member -NotePropertyName coveredBy -NotePropertyValue @($parents.Keys | Sort-Object) -Force
+    $f | Add-Member -NotePropertyName subsumed -NotePropertyValue ($covCount -gt 0 -and $covCount -eq @($f.matches).Count) -Force
+    $overlapMB += $covMB
+    $overlapPairs += $covCount
+    foreach ($pn in $parents.Keys) {
+        $overlapEdges.Add([pscustomobject]@{
+            child = [string]$f.id
+            parent = [string]$pn
+            mb = [math]::Round($parents[$pn], 0)
+        })
+    }
+}
+
 # ---------------- totals ----------------
 
+# Effective sizes, not raw ones: see the containment pass above.
 $safeMB = 0; $cautionMB = 0; $neverMB = 0
 foreach ($f in $findings) {
     switch ($f.risk) {
-        'safe' { $safeMB += $f.mb }
-        'caution' { $cautionMB += $f.mb }
-        'never' { $neverMB += $f.mb }
+        'safe' { $safeMB += $f.effectiveMB }
+        'caution' { $cautionMB += $f.effectiveMB }
+        'never' { $neverMB += $f.effectiveMB }
     }
+}
+
+# ---------------- volume reconciliation ----------------
+#
+# Three numbers describe the same disk and they are not supposed to be equal:
+#   entry  - one file counted once per directory that holds a name for it
+#            (Explorer and the walk engine do this; hard links inflate it)
+#   inode  - one file counted once, however many names it has
+#   used   - the volume's own counter: allocated clusters, which also include
+#            the $MFT, directory index allocations, cluster rounding and
+#            anything NTFS keeps outside file data streams
+# Publishing only one of them is what made the old report need a footnote.
+$inodeTotalMB = [int64]0
+$inodeMeasured = $true
+$hardLinkEntries = [int64]0
+$usedMB = [int64]0
+$freeMB = [int64]0
+foreach ($r in @($snap.roots)) {
+    if ($null -eq $r.totalMBUnique) { $inodeMeasured = $false }
+    else { $inodeTotalMB += [int64]$r.totalMBUnique }
+    if ($r.mftHardLinkEntries) { $hardLinkEntries += [int64]$r.mftHardLinkEntries }
+    $letter = ([string]$r.root).TrimEnd('\').TrimEnd(':').ToUpperInvariant() + ':'
+    foreach ($dv in @($snap.drives)) {
+        if (([string]$dv.mount).ToUpperInvariant() -eq $letter) {
+            $usedMB += [int64]$dv.usedMB
+            $freeMB += [int64]$dv.freeMB
+            break
+        }
+    }
+}
+
+$reconcileNote = ''
+$reconcileCode = 'not-measured'
+if ($inodeMeasured) {
+    $entryOverInode = $grandCur - $inodeTotalMB
+    $inodeOverUsed = $inodeTotalMB - $usedMB
+    $reconcileCode = 'inode-measured'
+    $rel = 'below'
+    $gap = -$inodeOverUsed
+    if ($inodeOverUsed -ge 0) { $rel = 'above'; $gap = $inodeOverUsed }
+    $reconcileNote = ('entry total is ' + $entryOverInode + ' MB above the inode total: that is hard links counted once per ' +
+                      'directory entry (' + $hardLinkEntries + ' extra entries on this volume). The inode total sits ' + $gap +
+                      ' MB ' + $rel + ' the volume used counter, because used space also holds the $MFT, directory ' +
+                      'index allocations, cluster rounding and VSS shadow storage, none of which lives in a file data stream.')
+}
+else {
+    $reconcileNote = ('the snapshot has no inode total (engine=' + $curEngine + '), so the only file figure available is the ' +
+                      'directory-entry total, which double counts hard links.')
 }
 
 $doc = [pscustomobject]@{
@@ -581,12 +712,30 @@ $doc = [pscustomobject]@{
     auditHome = $auditHome
     host = $snap.host
     drives = $snap.drives
-    rootTotals = @($snap.roots | ForEach-Object { [pscustomobject]@{ root = $_.root; totalMB = $_.totalMB; files = $_.files } })
+    rootTotals = @($snap.roots | ForEach-Object { [pscustomobject]@{ root = $_.root; totalMB = $_.totalMB; files = $_.files; totalMBUnique = $_.totalMBUnique; filesUnique = $_.filesUnique } })
     totals = [pscustomobject]@{
+        # Effective sizes: a finding contained in a delete-capable parent is not
+        # added again. These are the numbers a report may quote as "you can get
+        # this much back".
         safeMB = $safeMB
         cautionMB = $cautionMB
         neverMB = $neverMB
         reclaimableMB = $safeMB + $cautionMB
+        # How much of the raw per-finding sum was overlapping, so a reader can
+        # see the correction instead of having to trust it.
+        overlapMB = [math]::Round($overlapMB, 0)
+        overlapCount = $overlapPairs
+    }
+    overlap = @($overlapEdges | Sort-Object mb -Descending)
+    reconcile = [pscustomobject]@{
+        code = $reconcileCode
+        entryTotalMB = $grandCur
+        inodeTotalMB = $(if ($inodeMeasured) { $inodeTotalMB } else { $null })
+        entryOverInodeMB = $(if ($inodeMeasured) { $grandCur - $inodeTotalMB } else { $null })
+        volumeUsedMB = $usedMB
+        volumeFreeMB = $freeMB
+        hardLinkEntries = $hardLinkEntries
+        note = $reconcileNote
     }
     findings = @($findings | Sort-Object -Property @{Expression = 'mb'; Descending = $true})
     # `mft` means the finding sizes came out of one $MFT pass, `walk` means every
@@ -620,4 +769,4 @@ $doc | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $OutFile -Encoding UT
 
 $prevEngineTag = 'none'
 if ($prevEngine -ne '') { $prevEngineTag = $prevEngine }
-Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource)
+Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource + ' overlapMB=' + [math]::Round($overlapMB, 0) + ' reconcile=' + $reconcileCode)

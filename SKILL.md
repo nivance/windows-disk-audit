@@ -41,7 +41,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径的定向测尺：一次 $MFT 解析给出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，由 scan.ps1 / dirsizes.ps1 用 Add-Type 编译）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 自检：59 项断言，全在临时目录里跑，不碰真实数据
+│   └── selftest.ps1       # 自检：75 项断言，全在临时目录里跑，不碰真实数据
 ├── references/
 │   └── report-format.md   # 对话内报告模板
 └── fixtures/
@@ -78,6 +78,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 - 输出末尾一行 `RESULT <json路径> totalMB=... roots=1 engine=mft seconds=6.2`，把该路径记下来给 Step 2。
 - 快照默认落在 `$env:DISK_AUDIT_HOME\history\scan-<时间戳>.json`。
 - 用 MFT 时快照里还会有 `engine`、`engineNotes`、`mftRecords`、`mftHardLinkEntries`、`mftOrphans` 字段，报告里可用于解释口径（见「已知边界」）。
+- 每个 root 有两个总量：`totalMB`（按**目录项**计，硬链接每出现一个名字就计一次，与资源管理器/遍历引擎一致）和 `totalMBUnique` + `filesUnique`（按 **$MFT 记录号**去重，每个文件只计一次）。报告里说"C 盘有多少文件"用后者，说"某目录占多少"用前者。`walk` 引擎给不出 inode 口径，字段留 `null` 而不是拿 `totalMB` 顶替。
 
 ### Step 2 — 归因
 
@@ -85,7 +86,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 & "$S\scripts\analyze.ps1" -Snapshot '<上一步的json路径>'
 ```
 
-输出 `RESULT <analysis json> findings=... safeMB=... cautionMB=... growth=... anomalies=... engine=... sizeSource=...`。
+输出 `RESULT <analysis json> findings=... safeMB=... cautionMB=... growth=... anomalies=... engine=... sizeSource=... overlapMB=... reconcile=...`。
 
 把 analysis JSON 读进来，按 `findings` / `growth` / `anomalies` / `neverTouch` 组织报告。
 
@@ -109,6 +110,39 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | `no-previous` | 找不到可比的旧快照 | 明确说"本次为首次可比扫描，无增长数据"，**不要编造增长** |
 
 `growth` 只会和**同 root、同 depth** 的上一次快照对比。所以扫过 `C:\` 之后再单独扫 `C:\Users`，不会污染前者的增长榜 —— 但报告里要说明本次没有可比快照。
+
+**关于 `totals` 与 `findings[].effectiveMB`（"可释放 XX GB"必须用这个）**：规则是各自独立求值的，两条 finding 可能描述同一批字节（`huge-log` 量的是几个 jsonl 文件，`ai-cli-sessions` 量的是装着这些文件的目录）。两者都成立，但相加就把同一块空间数了两遍。
+
+analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `cleanMode` 是 `delete-dir` / `purge-contents`**（清它时整棵子树一起走）时，落在它里面的子 match 才被标为 covered；父是 `manual` / `command` 时不算 —— 宁可少报也不能许下拿不到的承诺。
+
+| 字段 | 含义 |
+|---|---|
+| `findings[].mb` | 原始体积（展示用） |
+| `findings[].effectiveMB` | 扣掉被父项覆盖部分后的体积 |
+| `findings[].coveredMB` / `coveredCount` / `coveredBy` | 被谁覆盖了多少 |
+| `findings[].subsumed` | 整个 finding 都在父项里（报告里写"已含于 X，不重复计入"） |
+| `totals.safeMB` / `cautionMB` / `reclaimableMB` | **全部按 effectiveMB 汇总**，这是可以直接兑现的数字 |
+| `totals.overlapMB` / `overlapCount` | 本次剔除掉多少重复 |
+| `overlap[]` | 每一条 `{child, parent, mb}` 覆盖关系，可逐条审计 |
+
+报告里提"可释放 X GB"时用 `totals.reclaimableMB`；若 `overlapMB > 0`，加一句"已剔除 N 条重叠（约 Y GB），清单里保留展示但不重复计入"。
+
+**关于 `reconcile`（三个总量对账）**：
+
+```json
+"reconcile": {
+  "code": "inode-measured",
+  "entryTotalMB": 164981, "inodeTotalMB": 142942, "entryOverInodeMB": 22039,
+  "volumeUsedMB": 151626, "volumeFreeMB": 17213,
+  "hardLinkEntries": 294145,
+  "note": "entry total is 22039 MB above the inode total: that is hard links ..."
+}
+```
+
+| `code` | 含义 | 报告写法 |
+|---|---|---|
+| `inode-measured` | 有 inode 口径可比 | "按目录项合计 164,981 MB、去重后 142,942 MB、卷已用 151,626 MB —— 前者多出的是 29.4 万个硬链接目录项，后者比去重值多的是 $MFT/目录索引/簇对齐等结构开销" |
+| `not-measured` | 快照来自 `walk` 或旧版本 | 只能说目录项口径，并说明它含硬链接重复 |
 
 ### Step 3 — 报告（对话内）
 
@@ -137,6 +171,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 - 只有 `cleanMode` 为 `delete-dir` / `purge-contents` 的项能自动执行；`command` / `manual` 只能给用户操作指引。用 `-Analysis -FindingIds` 时会自动跳过后两类。
 - 也可改用计划文件：`-Plan <json>`，格式 `{"items":[{"path":"...","mode":"delete-dir|purge-contents","id":"..."}]}`。`mode` 只接受这两个值，其余一律拒绝。
 - 清理后提醒用户：文件在**回收站**里，确认无误后再清空。
+- 清理结果里有 `movedToBinMB`（离开原目录的体积）、`verifiedMB` / `verifiedCount`（复查确认路径真的消失的部分）、`volumeReclaimedMB`（卷剩余空间前后差）。**三者本来就不该相等**：进回收站不释放空间，`volumeReclaimedMB` 要等清空回收站才会等于 `movedToBinMB`；脚本的 `note` 字段已写明这点，报告里不要把它们混为一谈。
+- `results[].ok` 是 API 返回值，`results[].verified` 才是"调用返回成功**且**路径确实不见了"。**报告以 `verified` 为准**：shell API 会在删除成功后报错，也会在文件被占用时静默失败。
+- 若 `unverifiedCount > 0`，逐项报 `results[].error`，不要笼统说"清理完成"。
 
 ## 安全红线（硬约束，任何情况下不得放宽）
 
@@ -183,7 +220,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | 一次遍历聚合 | 逐目录重复遍历是 O(n²)；walk 引擎用「一次遍历 + 哈希表按深度聚合」，mft 引擎用「一次解析 + 子树求和」 |
 | 跳过 reparse point | walk 引擎必须跳过，否则会在 junction 上死循环 |
 | 不要把宿主 stdout 交给子脚本 | 子脚本的 `RESULT` 行会污染调用方的输出（analyze 调 dirsizes 时用子进程 + 丢弃输出） |
-| `@($genericList)` 是雷 | 在 `[pscustomobject]@{...}` 里用 `@($list)` 包住泛型 List 会让转换抛 `ArgumentException: 参数类型不匹配`（PS 5.1）。改用 `$list.ToArray()` |
+| `@($genericList)` 是雷 | 在 `[pscustomobject]@{...}` 里用 `@($list)` 包住泛型 List 会让转换抛 `ArgumentException: 参数类型不匹配`（PS 5.1，**空 List 也抛**）。改用 `$list.ToArray()`。clean.ps1 曾因此**整个审计文件从未写成过**（异常发生在写文件之前，`$doc` 还残留着 plan 内容，结果把 plan 覆盖成输出文件）—— 所以清理脚本一律用独立变量名装结果，并对写文件单独 try/catch |
+| SHFileOperation 不认 `\\?\` 前缀 | 传长路径前缀会返回 `rc=124`（DE_INVALIDFILES），文件夹一动不动。`\\?\` 只给 Win32 文件 API 用，调 shell 前必须剥掉；超过 259 字符的路径直接报错并让用户手工删 |
+| NTFS 惰性写回 | 删除后 NTFS 不会立刻把记录改动刷回 $MFT，**刚删完就扫可能读到删除前的大小**。判别清理是否成功要用卷剩余空间 + `Test-Path` 复查，不要用"立刻重扫"来证明 |
 | 不要用 `$home` 当普通变量 | `$home` 是只读自动变量，赋值会静默失败，导致路径写错地方 |
 | 一条规则内的多个 pattern 可能命中同一目录 | `%TEMP%` 与 `%LOCALAPPDATA%\Temp` 在 Windows 上就是同一个目录。analyze 在**规则内**按规范化路径去重；不去重的话该 finding 的体积和 `matchCount` 都会翻倍（shipped 的 `user-temp` 曾把 1,596 MB 的 Temp 报成 3,192 MB）。规则文件保留两条是对的 —— `%TEMP%` 被重定向时二者确实是两个目录，所以要在代码里去重而不是删规则 |
 | 数组字面量里的 `+` 会被逗号抢先 | `@($a, $b + '\x*')` 在 PowerShell 里解析成**三个**元素（`, ` 优先级高于 `+`），会静默多测一个父目录。拼接字符串先赋给变量再放进数组 |
@@ -196,9 +235,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 & "$S\scripts\selftest.ps1"
 ```
 
-末行输出 `SELFTEST pass=59 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
+末行输出 `SELFTEST pass=75 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
 
-覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）。
+覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）、嵌套 findings 只计一次且 manual 父项不吃子项（T17）、inode 口径与硬链接数自洽（T18）、clean 删后复查（T19）。
+
+> T19 会真的把一个 500 字节的临时目录移进回收站 —— 这是唯一能证明"删后复查"有效的方式，清理它不影响任何东西。
 
 改动脚本后至少跑一次「全新环境」验证：
 
@@ -210,10 +251,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 ## 已知边界
 
 - 仅支持 Windows。`mft` 引擎额外要求 NTFS + 管理员权限，否则自动降级为 `walk`。
-- **两个引擎都按「目录项」计数**：一个文件若有 2 个硬链接（例如 WinSxS 与 System32 共享），会被计两次。因此 `WinSxS` 显示体积远大于真实占用，报告里必须说明，不能让用户以为删了能省 12 GB。快照里的 `mftHardLinkEntries` 就是超出基记录的额外目录项数量（本机 27.7 万）。
+- **目录体积按「目录项」计数，总量另有 inode 口径**：一个文件若有 2 个硬链接（例如 WinSxS 与 System32 共享），目录体积会把它计两次 —— 这与资源管理器一致，所以"某目录占多少"要按这个口径回答，不能让用户以为删了 WinSxS 能省 12 GB。要回答"C 盘到底用了多少"，用 `totalMBUnique`（按 $MFT 记录号去重）：本机 164,981 → 142,942 MB，差值 22,039 MB 正是 29.4 万个额外目录项。快照里的 `mftHardLinkEntries` 就是这些额外目录项的数量。
+- **`totalMBUnique` 与卷已用不相等也是正常的**：卷已用（本机 151,626 MB）还包含 $MFT 本身（约 1.7 GB）、目录 `$INDEX_ALLOCATION`、簇对齐浪费、VSS 影子存储等不落在任何文件数据流里的开销，所以它**高于**去重值。三者关系（目录项 ≥ 卷已用 ≥ 去重值 不一定成立，取决于压缩/稀疏）在报告里以 `reconcile.note` 为准，不要自己另算一套。
 - **`$MFT` 解析的现实坑**（已在 2026-10 修复，勿回退）：
   - `$FILE_NAME` 可能被挤到扩展记录里（基记录被长盘区表占满时）。**基记录没有 `$FILE_NAME` 不等于文件不存在**，必须仍标记为存活节点，否则会丢掉整棵树上的文件名与体积（本机实测因此漏掉过一个 1.1 GB 文件）。
   - 一个记录里可能有多个 `$DATA`：最低 VCN 那个带真实大小，续段报 0。要取**最大值**，否则真大小会被 0 覆盖。
   - `$DATA` 的 `0x30` 是分配大小、`0x38` 是逻辑大小。walker 与资源管理器都用逻辑大小，取 `0x38` 才能两个引擎口径一致（压缩/稀疏文件差异可达 40%）。
 - 无管理员权限时，`System Volume Information`（系统还原点）与部分系统目录无法统计，会体现在 `errorCount` 里。
-- 回收站清理依赖 SHFileOperation，超长路径（>260 字符）可能失败，会记录在结果里。
+- 回收站清理依赖 SHFileOperation，超过 259 字符的路径无法移入回收站（clean 会明确报错让用户手工处理），其余失败也会逐项记录在 `results[].error` 里。

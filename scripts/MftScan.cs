@@ -42,8 +42,18 @@ namespace DiskAudit
     public class MftRootResult
     {
         public string Root = "";
+        // Directory-entry accounting: a hard-linked file is counted once per
+        // directory that holds a name for it. This is what Explorer shows and
+        // what the walk engine produces, so per-directory numbers stay
+        // comparable across engines.
         public long TotalBytes;
         public long Files;
+        // Inode accounting: each file record counted exactly once, no matter how
+        // many names point at it. This is the number that reconciles with the
+        // volume's used-space counter, and the only honest answer to "how much
+        // is really on this disk".
+        public long UniqueBytes;
+        public long UniqueFiles;
         public long Dirs;
         public long Orphans;
         public long ExtensionRecords;
@@ -696,6 +706,8 @@ namespace DiskAudit
                 long[] subDirs = new long[cap];
                 long fileCount = 0, totalBytes = 0, orphanCount = 0;
                 long nameFallback = 0;
+                bool[] countedRecord = new bool[cap];
+                long uniqueFiles = 0, uniqueBytes = 0;
 
                 for (int i = 0; i < entries.Count; i++)
                 {
@@ -714,6 +726,19 @@ namespace DiskAudit
                     fileCount++;
                     totalBytes += sz;
 
+                    // A second name for the same record is a hard link: the file
+                    // occupies its clusters once no matter how many directories
+                    // list it. The directory totals above still count it per
+                    // entry (Explorer does the same), but this inode pass counts
+                    // it once, which is the figure that reconciles with the
+                    // volume's used-space counter.
+                    if (!countedRecord[e.Rec])
+                    {
+                        countedRecord[e.Rec] = true;
+                        uniqueFiles++;
+                        uniqueBytes += sz;
+                    }
+
                     int c = pr;
                     while (true)
                     {
@@ -726,6 +751,8 @@ namespace DiskAudit
                     }
                 }
                 res.NameSizeFallbackFiles = nameFallback;
+                res.UniqueFiles = uniqueFiles;
+                res.UniqueBytes = uniqueBytes;
 
                 for (int i = 0; i < cap; i++)
                 {

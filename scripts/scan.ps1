@@ -206,6 +206,12 @@ function Invoke-RootScan {
         root = $RootPath
         engine = 'walk'
         totalMB = [math]::Round($total / 1MB, 0)
+        # The walker counts a hard-linked file once per directory entry, so it
+        # has no inode figure to offer. Left as $null rather than silently
+        # reusing totalMB: a null says "not measured", a number would claim a
+        # reconciliation that never happened.
+        totalMBUnique = $null
+        filesUnique = $null
         files = $fileCount
         dirs = $dirCount
         buckets = $rows
@@ -288,6 +294,11 @@ function Invoke-MftRootScan {
         root = $RootPath
         engine = 'mft'
         totalMB = [math]::Round([double]$r.TotalBytes / 1MB, 0)
+        # Same pass, second accounting: each $MFT record once, so hard links are
+        # not counted twice. This is the figure that matches the volume's own
+        # used-space counter.
+        totalMBUnique = [math]::Round([double]$r.UniqueBytes / 1MB, 0)
+        filesUnique = [int64]$r.UniqueFiles
         files = [int64]$r.Files
         dirs = [int64]$r.Dirs
         buckets = $rows

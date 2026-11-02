@@ -23,8 +23,12 @@
     T14 the engine a snapshot came from is reported and mismatches are flagged
     T15 MFT engine: compiles, validates its root argument, sizes directories,
         honours -Engine walk and does not change which findings exist
-        and agrees with the walker (skipped when the MFT is unavailable)
     T16 a rule whose patterns overlap counts the shared folder only once
+    T17 findings that nest are not added twice, and a manual parent never
+        swallows its children
+    T18 the inode total ignores hard links and reconciles with the volume
+        counter (skipped without administrator rights)
+    T19 clean verifies what it deleted instead of trusting a return code
 
   This file MUST stay pure ASCII.
 #>
@@ -102,6 +106,9 @@ if (Test-Path -LiteralPath $anPath) {
     Check 'T1g empty rules produce no findings' (@($an.findings).Count -eq 0) ('findings=' + @($an.findings).Count)
     $noisy = @($an.anomalies | Where-Object { $_.kind -eq 'dir-very-large' -and $_.path -like '*Windows' })
     Check 'T1h protected dirs are not reported as anomalies' ($noisy.Count -eq 0) ('noise=' + ($noisy.path -join ','))
+    # The fixture predates the inode total, so this exercises the fallback: say
+    # "not measured" instead of quietly reusing the entry total.
+    Check 'T1i a snapshot without an inode total is flagged' ($an.reconcile.code -eq 'not-measured') ('code=' + $an.reconcile.code)
 }
 
 # ---- T2 no snapshot at all (first run) ----
@@ -509,6 +516,155 @@ if (Test-Path -LiteralPath $an16b) {
 else {
     Check 'T16d no shipped finding counts one folder twice' $false 'no analysis output'
 }
+
+# ---- T17 findings must not nest ----
+# Two rules can describe the same bytes: one sizes a folder, another sizes a
+# folder or file inside it. Both statements are true, but adding them counts the
+# space twice. A child is only credited to a parent whose clean mode would take
+# the whole subtree (delete-dir / purge-contents); a manual parent promises
+# nothing, so its children keep counting.
+$nestRoot = Join-Path $tmp 'nesttest'
+$nestOuter = Join-Path $nestRoot 'outer'
+$nestCache = Join-Path $nestOuter 'cache'
+$nestManual = Join-Path $nestRoot 'manual'
+$nestSub = Join-Path $nestManual 'sub'
+New-Item -ItemType Directory -Force -Path $nestCache, $nestSub | Out-Null
+[System.IO.File]::WriteAllBytes((Join-Path $nestOuter 'o.bin'), (New-Object 'byte[]' (1MB)))
+[System.IO.File]::WriteAllBytes((Join-Path $nestCache 'c.bin'), (New-Object 'byte[]' (2MB)))
+[System.IO.File]::WriteAllBytes((Join-Path $nestSub 's.bin'), (New-Object 'byte[]' (1MB)))
+
+$nestRules = Join-Path $tmp 'nest-rules.json'
+$nestDoc = [pscustomobject]@{
+    schema = 1
+    rules = @(
+        [pscustomobject]@{ id = 'nest-parent'; label = 'p'; category = 'test'; risk = 'safe'; cleanMode = 'delete-dir'; paths = @($nestOuter); cleanHint = 'p'; why = 'p' },
+        [pscustomobject]@{ id = 'nest-child'; label = 'p'; category = 'test'; risk = 'safe'; cleanMode = 'delete-dir'; paths = @($nestCache); cleanHint = 'p'; why = 'p' },
+        [pscustomobject]@{ id = 'nest-manual-parent'; label = 'p'; category = 'test'; risk = 'safe'; cleanMode = 'manual'; paths = @($nestManual); cleanHint = 'p'; why = 'p' },
+        [pscustomobject]@{ id = 'nest-manual-child'; label = 'p'; category = 'test'; risk = 'safe'; cleanMode = 'delete-dir'; paths = @($nestSub); cleanHint = 'p'; why = 'p' }
+    )
+    fileRules = @()
+    anomaly = [pscustomobject]@{ cacheDirMB = 5120; anyDirMB = 25600 }
+}
+$nestDoc | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $nestRules -Encoding UTF8
+$o17 = Invoke-Stage 'analyze.ps1' @{ Snapshot = $snapNew; RulesFile = $nestRules; MinFindingMB = 0 } $auditHome
+$r17 = Get-Result $o17
+$an17 = ''
+if ($r17 -ne '') { $an17 = ($r17 -split ' ')[1] }
+Check 'T17a nesting probe produced findings' ($an17 -ne '') $o17
+if (Test-Path -LiteralPath $an17) {
+    $d17 = Get-Content -LiteralPath $an17 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $by = @{}
+    foreach ($fx in $d17.findings) { $by[$fx.id] = $fx }
+    Check 'T17b all four probe findings present' ($by.Count -eq 4) ('ids=' + (($by.Keys | Sort-Object) -join ','))
+    $child = $by['nest-child']
+    Check 'T17c child inside a delete-dir parent is covered' (
+        $child -and [int]$child.effectiveMB -eq 0 -and [int]$child.coveredMB -eq 2 -and $child.subsumed -eq $true -and
+        (@($child.coveredBy) -contains 'nest-parent')) (
+        'effective=' + $child.effectiveMB + ' covered=' + $child.coveredMB + ' by=' + (@($child.coveredBy) -join ','))
+    $mchild = $by['nest-manual-child']
+    Check 'T17d child of a manual parent is still counted' (
+        $mchild -and [int]$mchild.coveredCount -eq 0 -and [int]$mchild.effectiveMB -eq 1) (
+        'effective=' + $mchild.effectiveMB + ' covered=' + $mchild.coveredCount)
+    Check 'T17e overlap total reports 2MB' ([int]$d17.totals.overlapMB -eq 2) ('overlapMB=' + $d17.totals.overlapMB)
+    Check 'T17f safe total uses effective sizes (5MB, not 7MB)' ([int]$d17.totals.safeMB -eq 5) ('safeMB=' + $d17.totals.safeMB)
+    $rawSum = 0; $effSum = 0
+    foreach ($fx in $d17.findings) { $rawSum += [int]$fx.mb; $effSum += [int]$fx.effectiveMB }
+    Check 'T17g effective sum equals raw sum minus overlap' (($rawSum - $effSum) -eq [int]$d17.totals.overlapMB) (
+        'raw=' + $rawSum + ' effective=' + $effSum + ' overlap=' + $d17.totals.overlapMB)
+}
+else { Check 'T17a nesting probe produced findings' $false 'no analysis output' }
+
+# ---- T18 the inode total must not count hard links twice ----
+# The directory-entry total is what Explorer shows and what the walker produces;
+# it counts a hard-linked file once per directory. The inode total counts each
+# $MFT record once, which is the figure that reconciles with the volume counter.
+$inodeSnap = Join-Path $tmp 'scan-inode.json'
+if (-not $isAdmin) {
+    Skip 'T18a scan carries an inode total' 'needs administrator rights'
+    Skip 'T18b inode total is below the entry total when hard links exist' 'needs administrator rights'
+    Skip 'T18c inode file count matches the hard link surplus' 'needs administrator rights'
+    Skip 'T18d analyze reconciles entry/inode/volume' 'needs administrator rights'
+}
+else {
+    $o18 = Invoke-Stage 'scan.ps1' @{ Root = ($env:SystemDrive + '\'); Depth = 1; Engine = 'mft'; OutFile = $inodeSnap; NoProgress = '' } $auditHome
+    if (-not (Test-Path -LiteralPath $inodeSnap)) {
+        Check 'T18a scan carries an inode total' $false ('no snapshot; ' + $o18)
+        Skip 'T18b inode total is below the entry total when hard links exist' 'no snapshot'
+        Skip 'T18c inode file count matches the hard link surplus' 'no snapshot'
+        Skip 'T18d analyze reconciles entry/inode/volume' 'no snapshot'
+    }
+    else {
+        $s18 = Get-Content -LiteralPath $inodeSnap -Raw -Encoding UTF8 | ConvertFrom-Json
+        $rt = $s18.roots[0]
+        $hasInode = ($null -ne $rt.totalMBUnique) -and ($null -ne $rt.filesUnique)
+        Check 'T18a scan carries an inode total' $hasInode ('totalMBUnique=' + $rt.totalMBUnique + ' filesUnique=' + $rt.filesUnique)
+        if ($hasInode) {
+            $hl = [int64]$rt.mftHardLinkEntries
+            $surplus = [int64]$rt.files - [int64]$rt.filesUnique
+            Check 'T18b inode total is below the entry total when hard links exist' (
+                [int64]$rt.totalMBUnique -gt 0 -and [int64]$rt.totalMBUnique -lt [int64]$rt.totalMB -and $hl -gt 0) (
+                'entry=' + $rt.totalMB + ' inode=' + $rt.totalMBUnique + ' hardLinks=' + $hl)
+            # Every extra directory entry is one more count in the entry total.
+            # The two figures have to agree; a gap means sizes and names drifted
+            # apart somewhere in the record parser.
+            $tolerance = [math]::Max(50, [int64]($hl / 100))
+            Check 'T18c inode file count matches the hard link surplus' (
+                $hl -gt 0 -and [math]::Abs($surplus - $hl) -le $tolerance) (
+                'files=' + $rt.files + ' filesUnique=' + $rt.filesUnique + ' surplus=' + $surplus + ' hardLinkEntries=' + $hl)
+        }
+        else {
+            Check 'T18b inode total is below the entry total when hard links exist' $false 'no inode total'
+            Check 'T18c inode file count matches the hard link surplus' $false 'no inode total'
+        }
+        $o18b = Invoke-Stage 'analyze.ps1' @{ Snapshot = $inodeSnap; RulesFile = $testRules } $auditHome
+        $r18b = Get-Result $o18b
+        $an18 = ''
+        if ($r18b -ne '') { $an18 = ($r18b -split ' ')[1] }
+        if (Test-Path -LiteralPath $an18) {
+            $d18 = Get-Content -LiteralPath $an18 -Raw -Encoding UTF8 | ConvertFrom-Json
+            $rc = $d18.reconcile
+            Check 'T18d analyze reconciles entry/inode/volume' (
+                $rc -and $rc.code -eq 'inode-measured' -and [int64]$rc.entryTotalMB -eq [int64]$rt.totalMB -and
+                [int64]$rc.inodeTotalMB -eq [int64]$rt.totalMBUnique -and [int64]$rc.volumeUsedMB -gt 0 -and
+                ([int64]$rc.entryTotalMB - [int64]$rc.inodeTotalMB) -eq [int64]$rc.entryOverInodeMB) (
+                'code=' + $rc.code + ' entry=' + $rc.entryTotalMB + ' inode=' + $rc.inodeTotalMB + ' used=' + $rc.volumeUsedMB)
+        }
+        else { Check 'T18d analyze reconciles entry/inode/volume' $false 'no analysis output' }
+    }
+}
+
+# ---- T19 clean must verify what it deleted ----
+# A return code is not evidence: the shell API reports an error after the item
+# has already moved, and reports success while a locked child stays behind. The
+# test asserts the contract - verified is exactly "the call said ok AND the path
+# is gone now" - and, when the move worked, that the folder really is gone.
+$planT19 = Join-Path $tmp 'plan-t19.json'
+$t19Target = Join-Path $junkRoot 'j1'
+[pscustomobject]@{ items = @([pscustomobject]@{ path = $t19Target; mode = 'delete-dir'; id = 'junk' }) } |
+    ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $planT19 -Encoding UTF8
+$o19 = Invoke-Stage 'clean.ps1' @{ Plan = $planT19; Confirmed = '' } $auditHome
+$r19 = Get-Result $o19
+Check 'T19a clean reports verification counts' ($r19 -like '*verified=*/*') $o19
+$c19 = ''
+if ($r19 -ne '') { $c19 = ($r19 -split ' ')[1] }
+if (Test-Path -LiteralPath $c19) {
+    $c = Get-Content -LiteralPath $c19 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $res = @($c.results)[0]
+    Check 'T19b clean doc carries the volume figures' (
+        $c.schema -eq 2 -and ($null -ne $c.movedToBinMB) -and ($null -ne $c.volumeFreeBeforeMB) -and
+        ($null -ne $c.volumeFreeAfterMB) -and $c.note -ne '') (
+        'schema=' + $c.schema + ' moved=' + $c.movedToBinMB + ' before=' + $c.volumeFreeBeforeMB + ' after=' + $c.volumeFreeAfterMB)
+    Check 'T19c verified means "ok and the path is gone"' (
+        $res -and $res.verified -eq ($res.ok -and -not $res.existsAfter)) (
+        'ok=' + $res.ok + ' existsAfter=' + $res.existsAfter + ' verified=' + $res.verified)
+    if ($res.ok) {
+        Check 'T19d the folder really left the disk' (-not (Test-Path -LiteralPath $t19Target)) 'target still exists after a successful clean'
+    }
+    else {
+        Skip 'T19d the folder really left the disk' ('clean could not move it: ' + $res.error)
+    }
+}
+else { Check 'T19a clean reports verification counts' $false 'no clean output' }
 
 # ---- T10 ASCII guard ----
 $bad = @()

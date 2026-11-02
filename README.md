@@ -72,10 +72,13 @@ C 盘从"还剩 50 GB"到"飘红"，通常是无声发生的。已有的工具�
 | **规则与代码分离** | 36 条目录规则 + 5 条文件名规则，全是 JSON；新增膨胀点只改数据、不改脚本 |
 | **增长对比** | 与上一次快照做差，输出"谁在涨、涨了多少"；只比对同 root 同 depth 的快照，避免串味 |
 | **引擎口径透明** | 快照记录自己由哪个引擎产生；跨引擎对比会打 `engineMismatch` 标记并说明 ~1% 口径差，绝不把口径差当成真实增长 |
+| **双口径总量** | 同一趟 `$MFT` 解析同时给出「按目录项」（与资源管理器一致）和「按 inode 去重」两个总量，并附 `reconcile` 对账块解释它们与卷已用空间的差额 |
+| **可释放量不重复** | findings 之间有包含关系时（大日志在会话目录里），只有父项是 `delete-dir` 才剔除子项；`manual` 父项不吃子项，宁可少报也不虚报 |
+| **清理有回执** | 删完不只看返回值：逐项 `Test-Path` 复查 + 卷剩余空间前后差，`verified` 才是"确实没了" |
 | **异常膨胀检测** | 单个缓存类目录 > 5 GB 直接标红。**这是挖出"隐形大户"的关键** —— 纯看总量发现不了它 |
 | **默认进回收站** | 用 `SHFileOperation` + `FOF_ALLOWUNDO`，误删可从回收站找回 |
 | **零依赖** | 只需系统自带的 PowerShell 5.1+，无需任何运行时 |
-| **自带回归测试** | 59 项断言，1 分钟跑完，全部在临时目录内运行，不碰真实数据；缺管理员权限时 MFT 断言报 SKIP 而非 FAIL |
+| **自带回归测试** | 75 项断言，1 分钟跑完，全部在临时目录内运行，不碰真实数据；缺管理员权限时 MFT 断言报 SKIP 而非 FAIL |
 
 ## 快速开始
 
@@ -177,6 +180,23 @@ System32 / WinSxS（硬链接，手删会搞坏系统）/ Fonts / Program Files 
 | `engine-mismatch` | 两次引擎不同，总量存在约 1% 口径差；目录级方向可信，2% 以内的 delta 视为噪声 |
 | `no-previous` | 找不到可比的旧快照（首次运行）——**这不等于"没有变化"** |
 
+`reconcile` 字段把三个口径一次说清（真实数据，C: 152 GB）：
+
+```json
+"reconcile": {
+  "code": "inode-measured",
+  "entryTotalMB": 164981, "inodeTotalMB": 142942, "entryOverInodeMB": 22039,
+  "volumeUsedMB": 151626, "volumeFreeMB": 17213, "hardLinkEntries": 294145
+}
+```
+
+`totals` 里的数字已经剔除 findings 之间的重复，可以直接当"能腾出多少"用：
+
+```json
+"totals": { "safeMB": 27591, "cautionMB": 27033, "reclaimableMB": 54624,
+            "overlapMB": 4043, "overlapCount": 6 }
+```
+
 ## 安全设计
 
 这个项目需要**删除能力**，所以安全约束是硬编码进脚本的，不是文档里的软建议：
@@ -200,7 +220,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径定向测尺：一次 $MFT 解析量出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，Add-Type 就地编译，无外部依赖）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 59 项回归断言
+│   └── selftest.ps1       # 75 项回归断言
 ├── rules/
 │   ├── caches.json        # 可清理规则库（36 条目录规则 + 5 条文件名规则）
 │   └── never-touch.json   # 红线目录，clean.ps1 的硬校验依据
@@ -241,10 +261,12 @@ windows-disk-audit/
 
 ```powershell
 & "$S\scripts\selftest.ps1"     # 约 1 分钟
-# 末行：SELFTEST pass=59 fail=0 skip=0 / RESULT-PASS
+# 末行：SELFTEST pass=75 fail=0 skip=0 / RESULT-PASS
 ```
 
-覆盖：增长对比与 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性（对已知 3 MB 文件）、System32 必须被拒绝、盘符根子目录必须被拒绝、批量上限、dry-run 零删除、无 `-Confirmed` 不动手、规则通配符解析、文件名规则去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合。
+覆盖：增长对比与 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性（对已知 3 MB 文件）、System32 必须被拒绝、盘符根子目录必须被拒绝、批量上限、dry-run 零删除、无 `-Confirmed` 不动手、规则通配符解析、文件名规则去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一规则内重叠 pattern 只计一次、嵌套 findings 只计一次且 `manual` 父项不吃子项、inode 口径与硬链接数自洽、clean 删后复查。
+
+其中"删后复查"会真的把一个 500 字节的临时目录移进回收站 —— 这是唯一能证明复查逻辑有效的方式。
 
 缺管理员权限时，MFT 相关断言报 `SKIP` 而不是 `FAIL` —— 换一台没有权限的机器也必须能跑通。
 
@@ -252,14 +274,18 @@ windows-disk-audit/
 
 - **仅支持 Windows**，依赖 PowerShell 5.1+（Windows 10 / 11 / Server 2016+ 均自带）
 - **`mft` 引擎需要管理员权限 + NTFS 卷 + 卷根作为 `-Root`**，否则自动降级为遍历；降级原因记在快照的 `engineNotes`
-- **`WinSxS` 显示体积远大于真实占用** —— 它与 System32 通过硬链接共享文件，而两个引擎都按**目录项**计数，所以共享文件被计两次（本机额外的目录项有 27.7 万个）。报告里必须说明，否则容易让人误以为删掉能省十几 GB
+- **`WinSxS` 显示体积远大于真实占用** —— 它与 System32 通过硬链接共享文件，而目录体积按**目录项**计数（与资源管理器一致），所以共享文件被计两次（本机额外的目录项有 29.4 万个）。报告里要说明，否则容易让人误以为删掉能省十几 GB。需要"这台盘到底用了多少"时用另一个口径：`totalMBUnique`（按 `$MFT` 记录号去重），本机 164,981 → 142,942 MB
+- **三个总量不相等是设计如此**：目录项合计 ≥ inode 合计（差值是硬链接），卷已用（151,626 MB）又比 inode 合计高，因为它还包含 `$MFT` 本身、目录 `$INDEX_ALLOCATION`、簇对齐浪费与 VSS 影子存储 —— 这些都不落在任何文件数据流里。analyze 的 `reconcile` 块会把这三个数与差额一次说清
+- **findings 之间的包含关系会被剔除**：`huge-log` 量的 3.3 GB 日志文件就躺在 `ai-cli-sessions` 量的目录里，两条都成立但不能相加。只有父项 `cleanMode` 是 `delete-dir` / `purge-contents` 时才剔除子项（`manual` 父项不吃子项，避免少报）；剔除量记在 `totals.overlapMB`，逐条关系在 `overlap[]` 里可审计
 - **`$MFT` 解析的三个现实坑**（已在 2026-10 修复，勿回退）：
   - 基记录被长盘区表占满时，`$FILE_NAME` 会被挤到扩展记录里。"基记录没有 `$FILE_NAME`" 不等于文件不存在 —— 若直接跳过该记录，整棵子树上的文件名与体积会一起消失（本机实测因此漏掉过一个 1.1 GB 文件）
   - 一个记录里可能有多个 `$DATA`：最低 VCN 那个带真实大小，续段报 0。必须取最大值，否则真大小被 0 覆盖
   - `$DATA` 头里 `0x30` 是分配大小、`0x38` 是逻辑大小。walker 与资源管理器都用逻辑大小，取 `0x38` 两个引擎口径才一致（压缩 / 稀疏文件差异可达 40%）
 - **无管理员权限时**，`System Volume Information`（系统还原点）等目录无法统计，会记入 `errorCount` 而非崩溃
-- **超长路径**（> 260 字符）在回收站操作时可能失败，会记录在结果里
-- 脚本固定使用 `\\?\` 前缀处理长路径，纯 ASCII 书写（PowerShell 5.1 会按 ANSI 代码页解析无 BOM 的 `.ps1`）
+- **超长路径**（> 259 字符）无法移入回收站：`SHFileOperation` 不接受 `\\?\` 前缀，超过 MAX_PATH 会直接报错让用户手工处理
+- **进回收站不等于释放空间**：`movedToBinMB` 是离开原目录的体积，`volumeReclaimedMB` 是卷剩余空间的实际变化，两者要等清空回收站后才相等；`verified` 才是"路径确实不见了"的判据（返回码可能骗人）
+- **NTFS 惰性写回**：删除后记录改动不会立刻刷回 `$MFT`，刚删完就扫描可能读到删除前的大小
+- 脚本固定使用 `\\?\` 前缀处理长路径（仅用于 Win32 文件 API，调 shell 前剥掉），纯 ASCII 书写（PowerShell 5.1 会按 ANSI 代码页解析无 BOM 的 `.ps1`）
 
 ## English
 
@@ -269,6 +295,8 @@ It answers the question most disk tools miss: *not just "what is big", but "what
 
 On NTFS it parses the Master File Table directly, so a full-volume scan of 1.4 million files takes **6 seconds instead of 274** and returns exact data. Without administrator rights it falls back to a directory walk automatically, records why in `engineNotes`, and everything else works the same — just slower. A second pass over the same MFT measures the rule library's matched directories, which brings the attribution step from 94 seconds down to 8.
 
-Cleanup is optional and deliberately conservative: nothing is ever deleted during collection, every single path must be confirmed explicitly (`-Confirmed`), deletions go to the Recycle Bin, at most 10 items per batch, and system-critical paths are refused outright.
+Cleanup is optional and deliberately conservative: nothing is ever deleted during collection, every single path must be confirmed explicitly (`-Confirmed`), deletions go to the Recycle Bin, at most 10 items per batch, and system-critical paths are refused outright. After deleting, it re-checks each path instead of trusting the shell's return code, and reports the volume's free-space delta separately — a recycle-bin move frees nothing until the bin is emptied, and saying otherwise would be a lie.
 
-Run `scripts/selftest.ps1` for the 59-assertion regression suite.
+Numbers are quoted twice on purpose: directory sizes count a hard-linked file once per entry (what Explorer shows), while a second inode-based total counts each MFT record once, so a report can state what the disk really holds without a footnote apologising for the sum. Findings that sit inside one another are counted once, and only when the parent is actually deleted wholesale.
+
+Run `scripts/selftest.ps1` for the 75-assertion regression suite.

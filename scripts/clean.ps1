@@ -49,6 +49,10 @@ public static class RecycleBin {
     private static extern int SHFileOperation(ref SHFILEOPSTRUCT lpFileOp);
 
     public static int Delete(string path) {
+        // SHFileOperation rejects the \\?\ long-path prefix with DE_INVALIDFILES
+        // (rc=124). The prefix is only for the Win32 file APIs, so strip it here
+        // and let the shell see the ordinary path it expects.
+        if (path != null && path.StartsWith("\\\\?\\")) path = path.Substring(4);
         SHFILEOPSTRUCT fs = new SHFILEOPSTRUCT();
         fs.wFunc = 0x0003;
         fs.pFrom = path + "\0\0";
@@ -106,6 +110,22 @@ function Get-PathSizeMB([string]$path) {
         }
     }
     return [math]::Round($total / 1MB, 1)
+}
+
+# Free space of the volume that holds a path. This is the only figure that
+# cannot be fooled by the filesystem: the per-item before/after measurement says
+# how much left the folder, but moving a folder to the Recycle Bin frees nothing
+# until the bin is emptied, and NTFS updates a record's size lazily on top of
+# that. Comparing the volume counter before and after is what tells the truth.
+function Get-VolumeFreeMB([string]$p) {
+    if (-not $p) { return [int64]-1 }
+    $m = [regex]::Match($p, '^([A-Za-z]:)')
+    if (-not $m.Success) { return [int64]-1 }
+    try {
+        $di = New-Object System.IO.DriveInfo($m.Groups[1].Value)
+        return [int64][math]::Round($di.AvailableFreeSpace / 1MB, 0)
+    }
+    catch { return [int64]-1 }
 }
 
 function Test-IsDriveRoot([string]$p) {
@@ -245,29 +265,47 @@ if (-not $Confirmed) {
 $results = New-Object System.Collections.Generic.List[object]
 $freed = 0
 $failed = 0
+$verifiedMB = 0
+$verifiedCount = 0
+$stillThere = 0
+
+# Volume free space around the whole run, per drive touched.
+$freeBefore = @{}
+foreach ($a in $accepted) {
+    $dl = ''
+    $mm = [regex]::Match($a.path, '^([A-Za-z]:)')
+    if ($mm.Success) { $dl = $mm.Groups[1].Value.ToUpperInvariant() }
+    if ($dl -ne '' -and -not $freeBefore.ContainsKey($dl)) { $freeBefore[$dl] = Get-VolumeFreeMB $a.path }
+}
 
 foreach ($a in $accepted) {
     $before = Get-PathSizeMB $a.path
     if ($before -lt 0) { $before = 0 }
     $ok = $true
     $err = ''
-
-    try {
-        if ($a.mode -eq 'purge-contents') {
-            $kids = [System.IO.Directory]::GetFileSystemEntries((Add-Prefix $a.path))
-            foreach ($k in $kids) {
-                $rc = [RecycleBin]::Delete($k)
-                if ($rc -ne 0) { $ok = $false; $err = ('SHFileOperation rc=' + $rc); break }
+    $shellBudget = 259
+    if ((Add-Prefix $a.path).Length -gt $shellBudget) {
+        $ok = $false
+        $err = 'path exceeds MAX_PATH; the shell recycle API cannot move it (delete it by hand)'
+    }
+    else {
+        try {
+            if ($a.mode -eq 'purge-contents') {
+                $kids = [System.IO.Directory]::GetFileSystemEntries((Add-Prefix $a.path))
+                foreach ($k in $kids) {
+                    $rc = [RecycleBin]::Delete($k)
+                    if ($rc -ne 0) { $ok = $false; $err = ('SHFileOperation rc=' + $rc); break }
+                }
+            }
+            else {
+                $rc = [RecycleBin]::Delete((Add-Prefix $a.path))
+                if ($rc -ne 0) { $ok = $false; $err = ('SHFileOperation rc=' + $rc) }
             }
         }
-        else {
-            $rc = [RecycleBin]::Delete((Add-Prefix $a.path))
-            if ($rc -ne 0) { $ok = $false; $err = ('SHFileOperation rc=' + $rc) }
+        catch {
+            $ok = $false
+            $err = $_.Exception.Message
         }
-    }
-    catch {
-        $ok = $false
-        $err = $_.Exception.Message
     }
 
     $after = Get-PathSizeMB $a.path
@@ -275,6 +313,24 @@ foreach ($a in $accepted) {
     $gained = $before - $after
     if ($gained -lt 0) { $gained = 0 }
     if ($ok) { $freed += $gained } else { $failed++ }
+
+    # Re-check the path instead of trusting the return code. The shell API can
+    # report an error after the item has already moved (it refreshes a source
+    # path that no longer exists), and it can also report success while a locked
+    # file refuses to budge. What the path looks like now is the only evidence.
+    $stillExists = Test-Path -LiteralPath (Add-Prefix $a.path)
+    $existsAfter = $stillExists
+    if ($a.mode -eq 'purge-contents' -and $stillExists) {
+        $left = 0
+        try { $left = @([System.IO.Directory]::GetFileSystemEntries((Add-Prefix $a.path))).Count } catch { $left = -1 }
+        $existsAfter = ($left -ne 0)
+    }
+    $verified = ($ok -and -not $existsAfter)
+    if ($verified) {
+        $verifiedMB += $gained
+        $verifiedCount++
+    }
+    elseif ($stillExists) { $stillThere++ }
 
     $results.Add([pscustomobject]@{
         path = $a.path
@@ -284,9 +340,36 @@ foreach ($a in $accepted) {
         afterMB = $after
         freedMB = $gained
         ok = $ok
+        existsAfter = $existsAfter
+        verified = $verified
         error = $err
     })
 }
+
+# Volume-level second opinion. Moving something to the Recycle Bin relocates it
+# inside the same volume, so free space is expected NOT to move by the amount
+# that left the folder. A positive delta here means the shell really did erase
+# something (permanent delete, or a bin purge racing with this run).
+$volumeReclaimed = [int64]0
+$volumeKnown = $false
+$freeAfter = @{}
+foreach ($dl in $freeBefore.Keys) {
+    foreach ($a in $accepted) {
+        if ([string]$a.path -match ('^' + [regex]::Escape($dl))) { $freeAfter[$dl] = Get-VolumeFreeMB $a.path; break }
+    }
+    if ($freeAfter.ContainsKey($dl) -and $freeBefore[$dl] -ge 0 -and $freeAfter[$dl] -ge 0) {
+        $volumeReclaimed += ($freeAfter[$dl] - $freeBefore[$dl])
+        $volumeKnown = $true
+    }
+}
+
+$binNote = ('Space is only returned to the volume once the Recycle Bin is emptied: ' +
+            'the items above moved into it, they were not erased. Per-item freedMB measures ' +
+            'what left each folder; volumeReclaimedMB measures what the volume actually gained, ' +
+            'so the two only match after a bin purge. Run Clear-RecycleBin -Force (or right-click ' +
+            'Empty Recycle Bin) and the space appears immediately. A scan started within a few ' +
+            'seconds of a clean can still read pre-delete sizes, because NTFS writes record ' +
+            'updates back lazily.')
 
 $auditHome = Get-AuditHome
 if (-not $OutFile -or $OutFile.Trim() -eq '') {
@@ -295,16 +378,52 @@ if (-not $OutFile -or $OutFile.Trim() -eq '') {
     $OutFile = Join-Path $hist ('clean-' + (Get-Date).ToString('yyyyMMdd-HHmmss') + '.json')
 }
 
-$doc = [pscustomobject]@{
-    schema = 1
+$fbSum = [int64]0
+$faSum = [int64]0
+foreach ($dl in $freeBefore.Keys) {
+    if ($freeBefore[$dl] -ge 0) { $fbSum += $freeBefore[$dl] }
+    if ($freeAfter.ContainsKey($dl) -and $freeAfter[$dl] -ge 0) { $faSum += $freeAfter[$dl] }
+}
+$unverified = @($results | Where-Object { -not $_.verified }).Count
+
+# Assigning this outside the object literal on purpose: Windows PowerShell 5.1
+# throws a bare "parameter type mismatch" ArgumentException when an inline
+# $(if ...) expression that can yield $null is used as a member value.
+$volReclaim = $null
+if ($volumeKnown) { $volReclaim = [int64]$volumeReclaimed }
+
+$cleanDoc = [pscustomobject]@{
+    schema = 2
     cleanedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     dryRun = $false
+    # How much left the listed folders. This is NOT how much the disk gained.
+    movedToBinMB = [math]::Round($freed, 0)
     freedMB = [math]::Round($freed, 0)
+    # The part of the above that a re-check could confirm.
+    verifiedMB = [math]::Round($verifiedMB, 0)
+    verifiedCount = $verifiedCount
+    unverifiedCount = $unverified
+    # Volume counter around the run, and what it actually gained.
+    volumeFreeBeforeMB = $fbSum
+    volumeFreeAfterMB = $faSum
+    volumeReclaimedMB = $volReclaim
+    note = $binNote
     failedCount = $failed
-    rejected = @($rejected)
-    results = @($results)
+    # .ToArray() rather than @($list): on Windows PowerShell 5.1 wrapping a
+    # generic List in @() *inside a hashtable literal* throws a bare
+    # "parameter type mismatch" ArgumentException, empty list included. This
+    # silently killed the audit file for the whole first release of this script.
+    rejected = $rejected.ToArray()
+    results = $results.ToArray()
 }
-$doc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutFile -Encoding UTF8
+try {
+    $cleanDoc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutFile -Encoding UTF8
+}
+catch {
+    Write-Host ('ERROR the audit file could not be written: ' + $_.Exception.Message)
+    Write-Host 'The deletions above did happen. Do not re-run this plan blindly.'
+    exit 6
+}
 
-Write-Host ('RESULT ' + $OutFile + ' freedMB=' + [math]::Round($freed, 0) + ' ok=' + ($results.Count - $failed) + ' failed=' + $failed)
-Write-Host 'Reminder: items were moved to the Recycle Bin, not erased. Empty it once you are satisfied.'
+Write-Host ('RESULT ' + $OutFile + ' freedMB=' + [math]::Round($freed, 0) + ' ok=' + ($results.Count - $failed) + ' failed=' + $failed + ' verified=' + $verifiedCount + '/' + $results.Count + ' volumeReclaimedMB=' + $(if ($volumeKnown) { $volumeReclaimed } else { 'unknown' }))
+Write-Host 'Reminder: items were moved to the Recycle Bin, not erased. Empty it once you are satisfied - only then does the space come back.'
