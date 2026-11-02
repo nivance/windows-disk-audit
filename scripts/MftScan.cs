@@ -20,6 +20,22 @@ namespace DiskAudit
         public long Bytes;
         public long Files;
         public long Dirs;
+        // Newest $STANDARD_INFORMATION write time anywhere in this subtree, in
+        // FILETIME ticks. Zero means "unknown" (a volume whose records carried no
+        // usable timestamp), and is reported as such rather than as 1601-01-01.
+        public long NewestTicks;
+    }
+
+    // One directory whose subtree is big enough to be worth ranking by age.
+    // Collected at every depth (not just the bucket depth), because the stale
+    // 8 GB folder is usually several levels below the interesting top-level
+    // directories.
+    public class MftAgeDir
+    {
+        public string Path;
+        public long Bytes;
+        public long NewestTicks;
+        public int Depth;
     }
 
     public class MftFileRef
@@ -77,6 +93,7 @@ namespace DiskAudit
         public long DiagExtEmpty;
         public string FileSystem = "NTFS";
         public List<MftBucket> Buckets = new List<MftBucket>();
+        public List<MftAgeDir> AgeDirs = new List<MftAgeDir>();
         public List<MftFileRef> BigFiles = new List<MftFileRef>();
         public List<MftFileRef> NotableFiles = new List<MftFileRef>();
         public List<MftTargetSize> TargetSizes = new List<MftTargetSize>();
@@ -437,15 +454,24 @@ namespace DiskAudit
         public static MftRootResult Scan(string letter, int maxDepth, long bigThreshold,
             long notableFloor, int maxBucket, int notableCap)
         {
-            return Scan(letter, maxDepth, bigThreshold, notableFloor, maxBucket, notableCap, null);
+            return Scan(letter, maxDepth, bigThreshold, notableFloor, maxBucket, notableCap, null, 0);
         }
 
         // `targets` names directories the caller wants exact subtree sizes for
         // (deep cache directories, for instance, that a snapshot bucket would not
         // reach). They are measured during the same single pass, which is why this
         // costs a fraction of a second instead of a fresh directory walk per path.
+        // `ageFloorBytes` additionally asks for every directory at any depth whose
+        // subtree reaches that size, together with the newest write time inside
+        // it; 0 turns the collection off.
         public static MftRootResult Scan(string letter, int maxDepth, long bigThreshold,
             long notableFloor, int maxBucket, int notableCap, string[] targets)
+        {
+            return Scan(letter, maxDepth, bigThreshold, notableFloor, maxBucket, notableCap, targets, 0);
+        }
+
+        public static MftRootResult Scan(string letter, int maxDepth, long bigThreshold,
+            long notableFloor, int maxBucket, int notableCap, string[] targets, long ageFloorBytes)
         {
             if (letter == null) throw new ArgumentNullException("letter");
             letter = letter.Trim().TrimEnd('\\', ':').Trim();
@@ -704,6 +730,17 @@ namespace DiskAudit
                 long[] subtree = new long[cap];
                 long[] subFiles = new long[cap];
                 long[] subDirs = new long[cap];
+                // Newest write time per subtree, so analyze can answer "what is
+                // big and has not been touched in a year" without a second walk.
+                // Seeded with each reachable directory's own timestamp: a
+                // directory's mtime moves when entries are added or removed, and
+                // a directory that has been read but not written for a year is
+                // exactly what the age ranking is looking for.
+                long[] subNewest = new long[cap];
+                for (int i = 0; i < cap; i++)
+                {
+                    if (isDirRec[i] && reach[i]) subNewest[i] = recMtime[i];
+                }
                 long fileCount = 0, totalBytes = 0, orphanCount = 0;
                 long nameFallback = 0;
                 bool[] countedRecord = new bool[cap];
@@ -744,6 +781,7 @@ namespace DiskAudit
                     {
                         subtree[c] += sz;
                         subFiles[c]++;
+                        if (recMtime[e.Rec] > subNewest[c]) subNewest[c] = recMtime[e.Rec];
                         if (c == ROOT_RECORD) break;
                         int up = parentRec[c];
                         if (up < 0 || up == c || up >= cap || !reach[up]) break;
@@ -773,7 +811,11 @@ namespace DiskAudit
                 // With targets in play the walk must reach any depth, because the
                 // caller's directories are usually far below the bucket depth.
                 string volPrefix = letter + ":\\";
-                int walkDepth = wantDirs.Count > 0 ? int.MaxValue : maxDepth;
+                // With targets in play the walk must reach any depth, because the
+                // caller's directories are usually far below the bucket depth. The
+                // age collection needs the same: the stale folder worth reporting
+                // is rarely at depth three.
+                int walkDepth = (wantDirs.Count > 0 || ageFloorBytes > 0) ? int.MaxValue : maxDepth;
                 if (wantDirs.Count > 0 && wantDirs.Contains(volPrefix))
                 {
                     MftTargetSize rootTs = new MftTargetSize();
@@ -800,6 +842,15 @@ namespace DiskAudit
                     stack.RemoveAt(last);
 
                     long sb = subtree[f.Rec];
+                    if (ageFloorBytes > 0 && sb >= ageFloorBytes)
+                    {
+                        MftAgeDir ad = new MftAgeDir();
+                        ad.Path = volPrefix + f.Path;
+                        ad.Bytes = sb;
+                        ad.NewestTicks = subNewest[f.Rec];
+                        ad.Depth = f.Depth;
+                        res.AgeDirs.Add(ad);
+                    }
                     if (sb > 0 && f.Depth <= maxDepth)
                     {
                         MftBucket b = new MftBucket();
@@ -808,6 +859,7 @@ namespace DiskAudit
                         b.Bytes = sb;
                         b.Files = subFiles[f.Rec];
                         b.Dirs = subDirs[f.Rec];
+                        b.NewestTicks = subNewest[f.Rec];
                         raw.Add(b);
                     }
                     if (wantDirs.Count > 0 && wantDirs.Contains(volPrefix + f.Path))
@@ -831,6 +883,15 @@ namespace DiskAudit
                         nf.Rec = e.Rec; nf.Depth = f.Depth + 1; nf.Path = prefix + e.Name;
                         stack.Add(nf);
                     }
+                }
+
+                // A whole volume's worth of "big enough to rank" directories can
+                // run into six figures; the report only ever reads the top of the
+                // list, and an unbounded array would bloat every snapshot.
+                if (res.AgeDirs.Count > 1500)
+                {
+                    res.AgeDirs.Sort(delegate(MftAgeDir a, MftAgeDir b) { return b.Bytes.CompareTo(a.Bytes); });
+                    res.AgeDirs.RemoveRange(1500, res.AgeDirs.Count - 1500);
                 }
 
                 Dictionary<int, List<MftBucket>> byDepth = new Dictionary<int, List<MftBucket>>();

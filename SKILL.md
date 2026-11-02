@@ -41,7 +41,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径的定向测尺：一次 $MFT 解析给出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，由 scan.ps1 / dirsizes.ps1 用 Add-Type 编译）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 自检：83 项断言，全在临时目录里跑，不碰真实数据
+│   └── selftest.ps1       # 自检：99 项断言，全在临时目录里跑，不碰真实数据
 ├── references/
 │   └── report-format.md   # 对话内报告模板
 └── fixtures/
@@ -74,11 +74,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 - 不传 `-Root` 时扫描所有固定磁盘。
 - `-Engine` 可强制 `mft` / `walk` / `auto`（默认）。**判断"能不能用 MFT"要让脚本自己做**，不要凭感觉传 `-Engine mft`：没有管理员权限时它会抛错并降级，白白多一步。
-- 耗时预期：MFT 引擎全盘约 **6 秒**；退化为遍历时 100 GB 量级需 **4-5 分钟**，属正常 I/O 耗时。需要快速定位时先用 `-Root 'C:\Users'` 缩小范围。
+- 耗时预期：MFT 引擎全盘约 **7 秒**（含久未写入榜的时间戳聚合）；退化为遍历时 100 GB 量级需 **4-5 分钟**，属正常 I/O 耗时。需要快速定位时先用 `-Root 'C:\Users'` 缩小范围。
 - 输出末尾一行 `RESULT <json路径> totalMB=... roots=1 engine=mft seconds=6.2`，把该路径记下来给 Step 2。
 - 快照默认落在 `$env:DISK_AUDIT_HOME\history\scan-<时间戳>.json`。
 - 用 MFT 时快照里还会有 `engine`、`engineNotes`、`mftRecords`、`mftHardLinkEntries`、`mftOrphans` 字段，报告里可用于解释口径（见「已知边界」）。
 - 每个 root 有两个总量：`totalMB`（按**目录项**计，硬链接每出现一个名字就计一次，与资源管理器/遍历引擎一致）和 `totalMBUnique` + `filesUnique`（按 **$MFT 记录号**去重，每个文件只计一次）。报告里说"C 盘有多少文件"用后者，说"某目录占多少"用前者。`walk` 引擎给不出 inode 口径，字段留 `null` 而不是拿 `totalMB` 顶替。
+- **年龄数据**（MFT 引擎）：`roots[].buckets[].newestWrite` 是该子树内最新的写入时间；`roots[].ageDirs[]` 是"任意深度、体积 ≥ `-AgeFloorMB`（默认 100 MB）"的目录清单（`path` / `mb` / `depth` / `newestWrite`，按体积取前 1500 个）。`walk` 引擎两者都为空 —— 遍历器不聚合时间戳，留空而不是编个日期。这一项让全盘扫描多约 1 秒。
 
 ### Step 2 — 归因
 
@@ -86,9 +87,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 & "$S\scripts\analyze.ps1" -Snapshot '<上一步的json路径>'
 ```
 
-输出 `RESULT <analysis json> findings=... safeMB=... cautionMB=... growth=... anomalies=... engine=... sizeSource=... overlapMB=... reconcile=... projFreeMB=...`。
+输出 `RESULT <analysis json> findings=... safeMB=... cautionMB=... growth=... anomalies=... engine=... sizeSource=... overlapMB=... reconcile=... projFreeMB=... stale=... staleMB=...`。
 
-把 analysis JSON 读进来，按 `findings` / `growth` / `anomalies` / `neverTouch` 组织报告。
+把 analysis JSON 读进来，按 `findings` / `growth` / `anomalies` / `age` / `neverTouch` 组织报告。
 
 **关于 `sizeSource`**：`mft` 表示各规则的目录体积来自一次 $MFT 解析（默认，快）；`walk` 表示逐目录遍历（慢约 10 倍，但同样准确）。降级原因在 `sizeNotes` 里，需要时如实告知用户。可用 `-SizeEngine walk` 强制走遍历做交叉验证。
 
@@ -181,6 +182,34 @@ analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `clean
 3. **可删清单** —— 按 `risk` 分 safe / caution 两档，每项给出体积与清理方式；清单末尾紧跟一句"清完剩约 XX GB（XX%）"（取 `projection`）
 4. **别删清单** —— 用 `neverTouch` 说明哪些不能动
 
+`anomalies` 单独醒目提示，带上 `sibling.verdict` 给的证词。`age` 有内容时追加一小节"很久没动过的大目录"（见 `references/report-format.md` 第六节）—— 这是规则库之外唯一能发现新大户的地方。
+
+**关于 `anomalies[].sibling`（兄弟佐证）**：固定阈值只能说"这个目录很大"，说不出"在这里算不算大"。5 GB 对一个 Chrome profile 是异常，对一排放 SDK 版本的目录就是常态。所以每个异常都附一份和**同级目录**的对比：
+
+| 字段 | 含义 |
+|---|---|
+| `peerCount` / `peerMedianMB` / `peerMaxMB` | 同级目录（不含自己）的数量、中位、最大 |
+| `peerTopPath` | 最大的那个同级目录 |
+| `ratio` | 自己 ÷ 同级最大，`0` 表示同级都测不到 |
+| `verdict` | `stands-out`（≥3 倍，警报可信）/ `above-peers`（1.5–3 倍）/ `comparable`（≤1.5 倍，属于结构性大小）/ `no-peers`（拿不到同级数据） |
+
+**它只加证词，不砍异常**：`comparable` 的条目照样报出来，只是措辞从"异常膨胀"改成"和同级目录体量相当，属于结构性问题（如按版本/按账号分目录），删它等于删功能"。`peerCount = 0` 时不要编理由，直接说"同级目录太少，无法比较"。
+
+**关于 `age`（久未写入的大目录）**：上面所有判断都来自规则库，只能发现"有人写过规则的东西"。`age` 反过来：不查规则，只看"体积 ≥ `thresholdMB` 且整个子树 `thresholdDays` 天没有任何写入"。
+
+```json
+"age": { "thresholdMB": 500, "thresholdDays": 30, "totalMB": 30032, "count": 29,
+         "dirs": [ { "path": "...\\Roaming\\WorkBuddy", "mb": 1205, "ageDays": 187,
+                     "newestWrite": "2026-04-29 11:20",
+                     "coveredByFinding": false, "protectedPath": false } ] }
+```
+
+- `count` 是全量条数，`dirs` 只给前 20 条（按体积降序，已剔除被父项包含的条目）。
+- `coveredByFinding = true` 表示这条已经在可删清单里 —— 报告里不要重复列出，也不要重复计入。
+- `protectedPath = true` 表示它在红线目录里（`Documents` / `Desktop` 等）：**建议迁移或让用户自己确认，不要说"可以删"**，`clean.ps1` 也会拒绝。
+- 口径要写清：`ageDays` 从**子树内最新一次写入**算起，所以一个每天被追加的日志目录看起来很"新"，它抓的是**被遗忘**的东西，不是"只增不减"的东西。
+- `Windows` / `Program Files` / `ProgramData` 下的目录不进这个榜：它们由系统与安装程序维护，"很久没写"不是可清理的信号。
+
 `anomalies` 里的条目要单独醒目提示（这是发现"隐形大户"的关键）。
 
 ### Step 4 — 清理（可选，需用户确认）
@@ -256,15 +285,15 @@ analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `clean
 
 ## 验证方式
 
-一键自检（约 1 分钟，全部在临时目录内运行，不碰真实数据）：
+一键自检（约 2 分钟，全部在临时目录内运行，不碰真实数据）：
 
 ```powershell
 & "$S\scripts\selftest.ps1"
 ```
 
-末行输出 `SELFTEST pass=83 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
+末行输出 `SELFTEST pass=99 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
 
-覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）、嵌套 findings 只计一次且 manual 父项不吃子项（T17）、inode 口径与硬链接数自洽（T18）、clean 删后复查（T19）、空间投影按盘归属且不重复计入（T20）。
+覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）、嵌套 findings 只计一次且 manual 父项不吃子项（T17）、inode 口径与硬链接数自洽（T18）、clean 删后复查（T19）、空间投影按盘归属且不重复计入（T20）、兄弟佐证与 Age 榜（T21-T23）。
 
 > T19 会真的把一个 500 字节的临时目录移进回收站 —— 这是唯一能证明"删后复查"有效的方式，清理它不影响任何东西。
 
@@ -285,4 +314,6 @@ analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `clean
   - 一个记录里可能有多个 `$DATA`：最低 VCN 那个带真实大小，续段报 0。要取**最大值**，否则真大小会被 0 覆盖。
   - `$DATA` 的 `0x30` 是分配大小、`0x38` 是逻辑大小。walker 与资源管理器都用逻辑大小，取 `0x38` 才能两个引擎口径一致（压缩/稀疏文件差异可达 40%）。
 - 无管理员权限时，`System Volume Information`（系统还原点）与部分系统目录无法统计，会体现在 `errorCount` 里。
+- **Age 榜量的是"最后一次写入"，不是"只增不减"**：`newestWrite` 取子树内所有文件与目录的最大 mtime，所以一个每天被追加的日志目录永远显示"很新"，不会进榜。它抓的是被遗忘的目录，不是不收敛的目录 —— 两者别混着说。另外这一项只在 `mft` 引擎下可用：`walk` 引擎不聚合时间戳，`ageDirs` 为空、`newestWrite` 为空字符串（而不是编一个日期），报告遇到空列表时要说"本次不可测"而不是"没有"。
+- **兄弟佐证拿不到同级时就是拿不到**：`peerCount = 0`（`verdict = no-peers`）表示父目录下没有别的目录，或 MFT 不可用无法测尺。这时只报体积，不要说"远超同类"。
 - 回收站清理依赖 SHFileOperation，超过 259 字符的路径无法移入回收站（clean 会明确报错让用户手工处理），其余失败也会逐项记录在 `results[].error` 里。

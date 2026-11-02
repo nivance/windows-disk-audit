@@ -724,6 +724,190 @@ if (Test-Path -LiteralPath $an20) {
 }
 else { Check 'T20a projection block is present' $false 'no analysis output' }
 
+# ---- T21 sibling proof ----
+# A threshold says "this directory is big". The siblings say "big *for here*".
+# The fixture builds two parents on purpose: under one the target matches its
+# neighbours (structural), under the other it towers over them (real anomaly).
+$sibRoot = Join-Path $tmp 'sib'
+$sibHome = Join-Path $sibRoot 'home'
+$sibDl = Join-Path $sibRoot 'dl'
+New-Item -ItemType Directory -Force -Path @(
+    (Join-Path $sibHome 'peerA'), (Join-Path $sibHome 'peerB'), (Join-Path $sibHome 'tiny1'),
+    (Join-Path $sibHome 'tiny2'), (Join-Path $sibDl 'solo'), (Join-Path $sibDl 'a'), (Join-Path $sibDl 'b')
+) | Out-Null
+$oneMB = New-Object 'byte[]' (1MB)
+# A hashtable, not an array of pairs: `@('x', 3)` inside another `@()` binds the
+# comma before the `+` and silently produces one string "x 3" instead of a pair.
+$sibSizes = [ordered]@{}
+$sibSizes['home\peerA'] = 3
+$sibSizes['home\peerB'] = 3
+$sibSizes['home\tiny1'] = 1
+$sibSizes['home\tiny2'] = 1
+$sibSizes['dl\solo'] = 6
+$sibSizes['dl\a'] = 1
+$sibSizes['dl\b'] = 1
+foreach ($rel in $sibSizes.Keys) {
+    $dir = Join-Path $sibRoot $rel
+    for ($i = 1; $i -le [int]$sibSizes[$rel]; $i++) {
+        [System.IO.File]::WriteAllBytes((Join-Path $dir ('f' + $i + '.bin')), $oneMB)
+    }
+}
+
+$sibVol = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+$sibTotal = 168839; $sibFree = 17162; $sibUsed = 151677
+if ($sibVol -and $sibVol.Size) {
+    $sibTotal = [math]::Round($sibVol.Size / 1MB, 0)
+    $sibFree = [math]::Round($sibVol.FreeSpace / 1MB, 0)
+    $sibUsed = $sibTotal - $sibFree
+}
+
+function Get-RelDepth([string]$rel) { return @($rel.Split('\')).Count }
+
+$relHome = $sibHome.Substring(3)
+$relDl = $sibDl.Substring(3)
+$oldStamp = (Get-Date).AddDays(-60).ToString('yyyy-MM-dd HH:mm')
+$freshStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+$userRel = 'Users\' + $env:USERNAME
+
+$sibBuckets = @()
+$sibPathMb = [ordered]@{}
+$sibPathMb[$relHome + '\peerA'] = 3
+$sibPathMb[$relHome + '\peerB'] = 3
+$sibPathMb[$relHome + '\tiny1'] = 1
+$sibPathMb[$relHome + '\tiny2'] = 1
+$sibPathMb[$relDl + '\solo'] = 6
+$sibPathMb[$relDl + '\a'] = 1
+$sibPathMb[$relDl + '\b'] = 1
+foreach ($rel in $sibPathMb.Keys) {
+    $sibBuckets += [pscustomobject]@{
+        root = 'C:\'
+        depth = (Get-RelDepth ([string]$rel))
+        path = [string]$rel
+        mb = [int]$sibPathMb[$rel]
+        newestWrite = $freshStamp
+    }
+}
+
+$sibAge = @(
+    [pscustomobject]@{ path = 'C:\' + $relHome + '\old';        mb = 800; depth = 5; newestWrite = $oldStamp },
+    [pscustomobject]@{ path = 'C:\' + $relHome + '\old\inner';  mb = 700; depth = 6; newestWrite = $oldStamp },
+    [pscustomobject]@{ path = 'C:\' + $relHome + '\fresh';      mb = 900; depth = 5; newestWrite = $freshStamp },
+    [pscustomobject]@{ path = 'C:\' + $relHome + '\small';      mb = 100; depth = 5; newestWrite = $oldStamp },
+    [pscustomobject]@{ path = 'C:\' + $userRel + '\Documents\sib-old'; mb = 600; depth = 4; newestWrite = $oldStamp },
+    [pscustomobject]@{ path = 'C:\Windows\sib-stale';           mb = 900; depth = 2; newestWrite = $oldStamp }
+)
+
+$sibSnap = Join-Path $tmp 'scan-sib.json'
+[pscustomobject]@{
+    schema = 1
+    scannedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    engine = 'mft'
+    depth = 3
+    drives = @([pscustomobject]@{ mount = 'C:'; label = ''; fileSystem = 'NTFS'; totalMB = $sibTotal; freeMB = $sibFree; usedMB = $sibUsed; usedPct = 0 })
+    roots = @([pscustomobject]@{
+        root = 'C:\'; engine = 'mft'
+        totalMB = 1000; totalMBUnique = 1000; files = 100; filesUnique = 100; dirs = 10
+        mftHardLinkEntries = 0
+        buckets = $sibBuckets
+        ageDirs = $sibAge
+    })
+    bigFiles = @()
+    recentBig = @()
+    errorCount = 0
+} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $sibSnap -Encoding UTF8
+
+$sibRules = Join-Path $tmp 'sib-rules.json'
+[pscustomobject]@{
+    schema = 1
+    rules = @(
+        [pscustomobject]@{ id = 'sib-peer'; label = 'p'; category = 'test'; risk = 'safe'; cleanMode = 'delete-dir'; paths = @((Join-Path $sibHome 'peerA')); cleanHint = 'p'; why = 'p' },
+        [pscustomobject]@{ id = 'sib-solo'; label = 'p'; category = 'test'; risk = 'safe'; cleanMode = 'delete-dir'; paths = @((Join-Path $sibDl 'solo')); cleanHint = 'p'; why = 'p' }
+    )
+    fileRules = @()
+    anomaly = [pscustomobject]@{ cacheDirMB = 2; anyDirMB = 999999; staleDirMB = 500; staleDays = 30 }
+} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $sibRules -Encoding UTF8
+
+$o21 = Invoke-Stage 'analyze.ps1' @{ Snapshot = $sibSnap; RulesFile = $sibRules; MinFindingMB = 0 } $auditHome
+$r21 = Get-Result $o21
+$an21 = ''
+if ($r21 -ne '') { $an21 = ($r21 -split ' ')[1] }
+Check 'T21a sibling probe produced an analysis' ($an21 -ne '') $o21
+if (Test-Path -LiteralPath $an21) {
+    $d21 = Get-Content -LiteralPath $an21 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $anoms = @($d21.anomalies)
+    Check 'T21b both probe directories are anomalies' ($anoms.Count -eq 2) ('count=' + $anoms.Count)
+
+    $peerAn = $null; $soloAn = $null
+    foreach ($a in $anoms) {
+        if (([string]$a.path) -like '*\peerA') { $peerAn = $a }
+        if (([string]$a.path) -like '*\solo') { $soloAn = $a }
+    }
+    Check 'T21c a directory the size of its neighbours is called comparable' (
+        $peerAn -and $peerAn.sibling.verdict -eq 'comparable' -and [int]$peerAn.sibling.peerCount -eq 3 -and
+        [math]::Abs([double]$peerAn.sibling.ratio - 1) -lt 0.01) (
+        'verdict=' + $(if ($peerAn) { $peerAn.sibling.verdict } else { 'n/a' }) + ' peers=' + $(if ($peerAn) { $peerAn.sibling.peerCount } else { 'n/a' }) + ' ratio=' + $(if ($peerAn) { $peerAn.sibling.ratio } else { 'n/a' }))
+    Check 'T21d a directory towering over its neighbours stands out' (
+        $soloAn -and $soloAn.sibling.verdict -eq 'stands-out' -and [double]$soloAn.sibling.ratio -ge 3) (
+        'verdict=' + $(if ($soloAn) { $soloAn.sibling.verdict } else { 'n/a' }) + ' ratio=' + $(if ($soloAn) { $soloAn.sibling.ratio } else { 'n/a' }))
+    $missing = 0
+    foreach ($a in $anoms) { if (-not $a.sibling) { $missing++ } }
+    Check 'T21e every anomaly carries sibling evidence' ($missing -eq 0) ('missing=' + $missing)
+}
+else { Check 'T21a sibling probe produced an analysis' $false 'no analysis output' }
+
+# ---- T22 age ranking ----
+# The one part of the analysis that does not consult the rule library: what is
+# big and has not been written to for a while. The fixture pins the four ways an
+# entry can be dropped: nested, fresh, below the size floor, and Windows-owned.
+$o22 = Invoke-Stage 'analyze.ps1' @{ Snapshot = $sibSnap; RulesFile = $sibRules; MinFindingMB = 0 } $auditHome
+$r22 = Get-Result $o22
+$an22 = ''
+if ($r22 -ne '') { $an22 = ($r22 -split ' ')[1] }
+Check 'T22a the age ranking is reported' ($r22 -like '*stale=*') $o22
+if (Test-Path -LiteralPath $an22) {
+    $d22 = Get-Content -LiteralPath $an22 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $ages = @($d22.age.dirs)
+    Check 'T22b nested, fresh and undersized directories are dropped' (
+        [int]$d22.age.count -eq 2 -and $ages.Count -eq 2) (
+        'count=' + $d22.age.count + ' dirs=' + (($ages | ForEach-Object { $_.path }) -join ' | '))
+    Check 'T22c the stale total only counts kept entries' ([int]$d22.age.totalMB -eq 1400) ('totalMB=' + $d22.age.totalMB)
+    $names = @($ages | ForEach-Object { [string]$_.path })
+    $nested = $false; $fresh = $false; $small = $false; $winOwned = $false
+    foreach ($n in $names) {
+        if ($n -like '*\old\inner') { $nested = $true }
+        if ($n -like '*\fresh') { $fresh = $true }
+        if ($n -like '*\small') { $small = $true }
+        if ($n -like 'C:\Windows\*') { $winOwned = $true }
+    }
+    Check 'T22d no nested entry survives the ranking' (-not $nested) ($names -join ' | ')
+    Check 'T22e a recently written directory is not stale' (-not $fresh) ($names -join ' | ')
+    Check 'T22f a directory below the size floor is not listed' (-not $small) ($names -join ' | ')
+    Check 'T22g Windows-owned trees are excluded' (-not $winOwned) ($names -join ' | ')
+    $protOk = $false
+    foreach ($a in $ages) {
+        if (([string]$a.path) -like '*\Documents\sib-old') { $protOk = ($a.protectedPath -eq $true) }
+        if (([string]$a.path) -like '*\home\old') { $protOk = $protOk -and ($a.protectedPath -eq $false) }
+    }
+    Check 'T22h protected user folders are flagged, not hidden' $protOk (
+        (($ages | ForEach-Object { $_.path + '=' + $_.protectedPath }) -join ' | '))
+    Check 'T22i ageDays is measured from the newest write time' (
+        [int]$ages[0].ageDays -ge 59 -and [int]$ages[0].ageDays -le 62) ('ageDays=' + $ages[0].ageDays)
+}
+else { Check 'T22a the age ranking is reported' $false 'no analysis output' }
+
+# ---- T23 a real scan carries the timestamps the ranking needs ----
+if ($rt -and [string]$rt.engine -eq 'mft') {
+    $b0 = @($rt.buckets)[0]
+    $hasStamp = ($b0 -and [string]$b0.newestWrite -ne '')
+    $hasAge = (@($rt.ageDirs).Count -gt 0)
+    Check 'T23a real snapshot buckets carry a newest write time' $hasStamp ('newestWrite=' + $(if ($b0) { $b0.newestWrite } else { 'n/a' }))
+    Check 'T23b real snapshot carries the age candidate list' $hasAge ('ageDirs=' + @($rt.ageDirs).Count)
+}
+else {
+    Skip 'T23a real snapshot buckets carry a newest write time' 'walk engine; no timestamps to carry'
+    Skip 'T23b real snapshot carries the age candidate list' 'walk engine; no timestamps to carry'
+}
+
 # ---- T10 ASCII guard ----
 $bad = @()
 foreach ($name in @('scan.ps1', 'analyze.ps1', 'clean.ps1', 'selftest.ps1', 'dirsizes.ps1')) {

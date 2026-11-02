@@ -33,6 +33,10 @@ param(
     [int]$RecentDays = 45,
     [int]$RecentMinMB = 100,
     [int]$MaxBucket = 60,
+    # Subtree size floor for the age ranking's candidate list. Every directory
+    # of at least this size, at any depth, is recorded with the newest write
+    # time found inside it (MFT engine only).
+    [int]$AgeFloorMB = 100,
     [ValidateSet('auto', 'mft', 'walk')]
     [string]$Engine = 'auto',
     [switch]$NoProgress
@@ -198,6 +202,9 @@ function Invoke-RootScan {
                 depth = $d
                 path = [string]$kv.Key
                 mb = [math]::Round($kv.Value / 1MB, 0)
+                # The walker does not aggregate timestamps, so the age ranking
+                # cannot run on a walk snapshot. Empty, not a fake date.
+                newestWrite = ''
             })
         }
     }
@@ -215,6 +222,8 @@ function Invoke-RootScan {
         files = $fileCount
         dirs = $dirCount
         buckets = $rows
+        # No timestamps are aggregated on this path; see the mft branch.
+        ageDirs = @()
     }
 }
 
@@ -255,20 +264,42 @@ function Invoke-MftRootScan {
         [int64]$BigThreshold,
         [int64]$NotableFloor,
         [int]$MaxBucket,
+        [int64]$AgeFloorBytes,
         [System.Collections.Generic.List[object]]$BigFiles,
         [System.Collections.Generic.List[object]]$NotableFiles
     )
 
     $letter = $RootPath.TrimEnd('\').TrimEnd(':')
-    $r = [DiskAudit.MftScanner]::Scan($letter, $Depth, $BigThreshold, $NotableFloor, $MaxBucket, 200000)
+    $r = [DiskAudit.MftScanner]::Scan($letter, $Depth, $BigThreshold, $NotableFloor, $MaxBucket, 200000, [string[]]@(), $AgeFloorBytes)
+
+    $ageRows = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $r.AgeDirs) {
+        $newest = ''
+        if ([long]$a.NewestTicks -gt 0) {
+            $newest = (Convert-MftFileTime ([long]$a.NewestTicks)).ToString('yyyy-MM-dd HH:mm')
+        }
+        $ageRows.Add([pscustomobject]@{
+            path  = [string]$a.Path
+            mb    = [math]::Round([double]$a.Bytes / 1MB, 0)
+            depth = [int]$a.Depth
+            newestWrite = $newest
+        })
+    }
 
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($b in $r.Buckets) {
+        # The age ranking needs "when was this subtree last written". The MFT
+        # pass already has the timestamp in hand, so it costs nothing here.
+        $newest = ''
+        if ([long]$b.NewestTicks -gt 0) {
+            $newest = (Convert-MftFileTime ([long]$b.NewestTicks)).ToString('yyyy-MM-dd HH:mm')
+        }
         $rows.Add([pscustomobject]@{
             root  = $RootPath
             depth = [int]$b.Depth
             path  = [string]$b.Path
             mb    = [math]::Round([double]$b.Bytes / 1MB, 0)
+            newestWrite = $newest
         })
     }
 
@@ -302,6 +333,10 @@ function Invoke-MftRootScan {
         files = [int64]$r.Files
         dirs = [int64]$r.Dirs
         buckets = $rows
+        # Directories at any depth whose subtree reaches -AgeFloorMB, each with
+        # the newest write time inside it. Empty on the walk engine: the walker
+        # does not aggregate timestamps, and a fake date would be worse than none.
+        ageDirs = $ageRows
         mftRecords = [int64]$r.RecordCount
         mftHardLinkEntries = [int64]$r.HardLinkEntries
         mftOrphans = [int64]$r.Orphans
@@ -325,6 +360,9 @@ $Root = $Root | Where-Object { $_ -and $_.Trim() -ne '' }
 
 $BigThreshold = [int64]$MinBigFileMB * 1MB
 $NotableFloor = [int64]([math]::Min($RecentMinMB, $MinBigFileMB)) * 1MB
+# Directories below this are not worth ranking by age: the report only surfaces
+# folders worth acting on, and collecting everything would bloat the snapshot.
+$AgeFloorBytes = [int64]$AgeFloorMB * 1MB
 $cut = (Get-Date).AddDays(-1 * $RecentDays)
 
 $big = New-Object 'System.Collections.Generic.List[object]'
@@ -350,6 +388,7 @@ foreach ($r in $Root) {
             try {
                 $res = Invoke-MftRootScan -RootPath $r -Depth $Depth -BigThreshold $BigThreshold `
                                           -NotableFloor $NotableFloor -MaxBucket $MaxBucket `
+                                          -AgeFloorBytes $AgeFloorBytes `
                                           -BigFiles $big -NotableFiles $notable
                 $rootResults.Add($res)
                 $done = $true
@@ -406,6 +445,7 @@ $doc = [pscustomobject]@{
         minBigFileMB = $MinBigFileMB
         recentDays = $RecentDays
         recentMinMB = $RecentMinMB
+        ageFloorMB = $AgeFloorMB
     }
     drives = Get-VolumeInfo
     roots = $rootResults

@@ -158,6 +158,14 @@ function Test-InNeverTouch([string]$path, $neverPaths, $denyNames) {
     return $null
 }
 
+# The displayed match list can be truncated (a file rule keeps the top 30 for the
+# report), while the money has to be counted on the full list. This returns
+# whichever list is authoritative for arithmetic.
+function Get-AccountingMatches($f) {
+    if ($f.PSObject.Properties['allMatches']) { return @($f.allMatches) }
+    return @($f.matches)
+}
+
 # ---------------- load inputs ----------------
 
 $auditHome = Get-AuditHome
@@ -191,6 +199,13 @@ $neverPaths = @()
 foreach ($p in $never.exactPaths) { $neverPaths += (Expand-Pattern $p) }
 foreach ($p in $never.paths) { $neverPaths += (Expand-Pattern $p) }
 $neverPaths = @($neverPaths | Sort-Object -Unique)
+# `exactPaths` protects a directory from being deleted as a target; it does not
+# protect everything under it (deleting %LOCALAPPDATA% is absurd, deleting a
+# cache below it is the normal case). Only `paths` protects a whole subtree, and
+# that is the distinction the age ranking needs when it calls something protected.
+$neverPrefixPaths = @()
+foreach ($p in $never.paths) { $neverPrefixPaths += (Expand-Pattern $p) }
+$neverPrefixPaths = @($neverPrefixPaths | Sort-Object -Unique)
 $denyNames = @()
 if ($never.denyNamePatterns) { $denyNames = @($never.denyNamePatterns) }
 
@@ -227,20 +242,31 @@ foreach ($rule in $ruleList) {
 }
 
 $script:sizeMap = @{}
+$script:sizeNotes = New-Object System.Collections.Generic.List[string]
 $sizeSource = 'walk'
-$sizeNotes = @()
-if ($SizeEngine -ne 'walk' -and $wantDirs.Count -gt 0) {
+
+# Measure a batch of directories in ONE $MFT pass, via dirsizes.ps1 in a child
+# process. Batched on purpose: sizing the siblings of an anomaly one directory at
+# a time would pay the $MFT parse once per directory, and the parse - not the
+# number of paths - is what costs time.
+#
+# A child process also keeps the helper's own RESULT line and its Add-Type
+# compilation out of this script's output, where either would be mistaken for
+# the analysis result by whoever parses it.
+function Invoke-DirSizeHelper {
+    param([string[]]$Dirs)
+
+    if (-not $Dirs -or $Dirs.Count -eq 0) { return '' }
+    if ($SizeEngine -eq 'walk') { return 'walk' }
+
     $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
     $listFile = Join-Path ([System.IO.Path]::GetTempPath()) ('diskaudit-targets-' + $tag + '.txt')
     $dsOut = Join-Path ([System.IO.Path]::GetTempPath()) ('diskaudit-dirsizes-' + $tag + '.json')
+    $used = 'walk'
     try {
         # WriteAllLines needs a real string[], not the Object[] that the pipeline
         # produces; PowerShell reports the mismatch as a binding error otherwise.
-        [System.IO.File]::WriteAllLines($listFile, [string[]]@($wantDirs | Sort-Object -Unique), (New-Object System.Text.UTF8Encoding($false)))
-        # A child process on purpose: the helper prints its own RESULT line, and
-        # anything that leaked into this script's output would be mistaken for the
-        # analysis result by whoever parses it. A child also keeps the helper's
-        # `exit` codes and its Add-Type compilation from touching this run.
+        [System.IO.File]::WriteAllLines($listFile, [string[]]@($Dirs), (New-Object System.Text.UTF8Encoding($false)))
         $dsArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dirSizeScript,
                     '-PathsFile', $listFile, '-OutFile', $dsOut, '-Engine', $SizeEngine)
         [void](& $psExe @dsArgs 2>&1 | Out-Null)
@@ -249,28 +275,56 @@ if ($SizeEngine -ne 'walk' -and $wantDirs.Count -gt 0) {
             if ($ds.engine -eq 'mft') {
                 foreach ($s in $ds.sizes) {
                     $k = ([string]$s.path).TrimEnd('\').ToLowerInvariant()
-                    $sizeMap[$k] = [math]::Round([double]$s.bytes / 1MB, 0)
+                    $script:sizeMap[$k] = [math]::Round([double]$s.bytes / 1MB, 0)
                 }
-                $sizeSource = 'mft'
+                $used = 'mft'
                 if ([int]$ds.missing -gt 0) {
-                    $sizeNotes += ([string]$ds.missing + ' of ' + [string]$ds.requested + ' matched directories were not in the MFT and were walked instead')
+                    $script:sizeNotes.Add([string]$ds.missing + ' of ' + [string]$ds.requested + ' matched directories were not in the MFT and were walked instead')
                 }
             }
             else {
-                $sizeNotes += ('the MFT directory sizer reported engine=' + [string]$ds.engine + ' (' + [string]$ds.reason + '); every path was walked')
+                $script:sizeNotes.Add('the MFT directory sizer reported engine=' + [string]$ds.engine + ' (' + [string]$ds.reason + '); every path was walked')
             }
         }
         else {
-            $sizeNotes += 'the MFT directory sizer produced no output; every path was walked'
+            $script:sizeNotes.Add('the MFT directory sizer produced no output; every path was walked')
         }
     }
     catch {
-        $sizeNotes += ('the MFT directory sizer failed: ' + $_.Exception.Message)
+        $script:sizeNotes.Add('the MFT directory sizer failed: ' + $_.Exception.Message)
     }
     finally {
         Remove-Item -LiteralPath $listFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $dsOut -Force -ErrorAction SilentlyContinue
     }
+    return $used
+}
+
+if ($wantDirs.Count -gt 0) {
+    # Sibling sizes have to be measured BEFORE the anomalies are known: anomalies
+    # come from findings, and findings need sizes. Collecting the siblings of
+    # every rule directory in this same pass costs almost nothing (the $MFT parse
+    # dominates, not the path count), while a second pass after the fact costs
+    # several seconds on every run that found an anomaly.
+    $peerCandidates = New-Object System.Collections.Generic.List[string]
+    foreach ($d in $wantDirs) {
+        $parent = ''
+        try { $parent = [System.IO.Path]::GetDirectoryName($d) } catch { $parent = '' }
+        if (-not $parent) { continue }
+        $kids = @()
+        try { $kids = @([System.IO.Directory]::GetDirectories((Add-Prefix $parent))) } catch { $kids = @() }
+        $n = 0
+        foreach ($kid in $kids) {
+            if ($n -ge 12) { break }
+            $kk = $kid.Substring($script:Prefix.Length)
+            if ($kk.TrimEnd('\') -ieq ([string]$d).TrimEnd('\')) { continue }
+            $peerCandidates.Add($kk)
+            $n++
+        }
+    }
+    $allTargets = @($wantDirs)
+    if ($peerCandidates.Count -gt 0) { $allTargets = @($wantDirs + $peerCandidates) }
+    if ((Invoke-DirSizeHelper ([string[]]@($allTargets | Sort-Object -Unique))) -eq 'mft') { $sizeSource = 'mft' }
 }
 # Anything the MFT map does not cover is walked once and remembered, so a path
 # named by several rules is never walked twice.
@@ -550,6 +604,242 @@ foreach ($r in $snap.roots) {
     }
 }
 
+# ---------------- sibling proof ----------------
+#
+# A fixed threshold cannot tell "this cache grew out of hand" from "this tree is
+# big by design": 5 GB is alarming for one Chrome profile and normal for a folder
+# of per-version SDK installs. Comparing a directory against its OWN siblings is
+# threshold-free - if the neighbours are the same size, the size is structural;
+# if it towers over them, the alarm is real.
+#
+# This only adds evidence. It never suppresses an anomaly: a wrong threshold is
+# better reported with a note than silently dropped.
+$peerIndex = @{}
+foreach ($k in $dirLookup.Keys) {
+    $parentKey = ''
+    $ix = $k.LastIndexOf('\')
+    if ($ix -gt 3) { $parentKey = $k.Substring(0, $ix) }
+    if ($parentKey -eq '') { continue }
+    if (-not $peerIndex.ContainsKey($parentKey)) { $peerIndex[$parentKey] = New-Object System.Collections.Generic.List[object] }
+    $peerIndex[$parentKey].Add([pscustomobject]@{ path = $k; mb = [double]$dirLookup[$k] })
+}
+
+function Get-Median($values) {
+    $a = @($values | Sort-Object)
+    if ($a.Count -eq 0) { return 0 }
+    $mid = [int][math]::Floor($a.Count / 2)
+    if ($a.Count % 2 -eq 1) { return [double]$a[$mid] }
+    return ([double]$a[$mid - 1] + [double]$a[$mid]) / 2
+}
+
+$siblingChecked = 0
+$peerNeed = @()
+$peerLive = @{}
+foreach ($a in $anomalies) {
+    if ($siblingChecked -ge 12) { break }
+    $siblingChecked++
+    $selfPath = ([string]$a.path).TrimEnd('\')
+    $selfKey = $selfPath.ToLowerInvariant()
+    $parentPath = [System.IO.Path]::GetDirectoryName($selfPath)
+    $peers = @()
+    if ($parentPath -and $peerIndex.ContainsKey($parentPath.ToLowerInvariant())) {
+        foreach ($p in $peerIndex[$parentPath.ToLowerInvariant()]) {
+            if ($p.path -ne $selfKey) { $peers += $p }
+        }
+    }
+    # Buckets only reach the scan depth, so a deep anomaly has no peers on record.
+    # List the parent once and remember the neighbours; every anomaly's list is
+    # batched into ONE $MFT pass below, because the parse - not the path count -
+    # is what costs seconds.
+    if ($peers.Count -eq 0 -and $parentPath) {
+        $live = @()
+        try { $live = @([System.IO.Directory]::GetDirectories((Add-Prefix $parentPath))) } catch { $live = @() }
+        if ($live.Count -gt 1) {
+            $live = @($live | Select-Object -First 12)
+            $peerLive[$selfKey] = $live
+            foreach ($lp in $live) {
+                $p2 = $lp.Substring($script:Prefix.Length)
+                $k2 = $p2.TrimEnd('\').ToLowerInvariant()
+                if ($k2 -eq $selfKey) { continue }
+                $k2 = $p2.TrimEnd('\').ToLowerInvariant()
+                if (-not $script:sizeMap.ContainsKey($k2)) { $peerNeed += $p2 }
+            }
+        }
+    }
+}
+if ($peerNeed.Count -gt 0) {
+    # Returns 'walk' when the MFT engine is unavailable; then no sizes were
+    # merged and the anomalies below stay at "no peers" rather than walking a
+    # dozen subtrees to guess.
+    [void](Invoke-DirSizeHelper ([string[]]@($peerNeed | Sort-Object -Unique)))
+}
+
+foreach ($a in $anomalies) {
+    $selfPath = ([string]$a.path).TrimEnd('\')
+    $selfKey = $selfPath.ToLowerInvariant()
+    $parentPath = [System.IO.Path]::GetDirectoryName($selfPath)
+    $peers = @()
+    if ($parentPath -and $peerIndex.ContainsKey($parentPath.ToLowerInvariant())) {
+        foreach ($p in $peerIndex[$parentPath.ToLowerInvariant()]) {
+            if ($p.path -ne $selfKey) { $peers += $p }
+        }
+    }
+    if ($peers.Count -eq 0 -and $peerLive.ContainsKey($selfKey)) {
+        foreach ($lp in $peerLive[$selfKey]) {
+            $p2 = $lp.Substring($script:Prefix.Length)
+            $k2 = $p2.TrimEnd('\').ToLowerInvariant()
+            if ($k2 -eq $selfKey) { continue }
+            if ($script:sizeMap.ContainsKey($k2)) {
+                $peers += [pscustomobject]@{ path = $k2; mb = [double]$script:sizeMap[$k2] }
+            }
+        }
+    }
+
+    $verdict = 'no-peers'
+    $ratio = 0
+    $peerMax = 0
+    $peerMedian = 0
+    $topPath = ''
+    if ($peers.Count -gt 0) {
+        # Empty sibling directories are evidence too, but a median dragged to 0
+        # by a dozen empty folders reads as broken. The max keeps them honest:
+        # ratio is computed against the biggest neighbour, not the average.
+        $vals = @($peers | ForEach-Object { [double]$_.mb } | Where-Object { $_ -gt 0 })
+        if ($vals.Count -eq 0) { $vals = @(0) }
+        $peerMax = ($vals | Measure-Object -Maximum).Maximum
+        $peerMedian = Get-Median $vals
+        $top = $peers | Sort-Object mb -Descending | Select-Object -First 1
+        $topPath = [string]$top.path
+        if ($peerMax -gt 0) { $ratio = [math]::Round(([double]$a.mb / $peerMax), 2) }
+        if ($ratio -ge 3) { $verdict = 'stands-out' }
+        elseif ($ratio -le 1.5) { $verdict = 'comparable' }
+        else { $verdict = 'above-peers' }
+    }
+    $a | Add-Member -NotePropertyName sibling -NotePropertyValue ([pscustomobject]@{
+        peerCount = $peers.Count
+        peerMedianMB = [math]::Round($peerMedian, 0)
+        peerMaxMB = [math]::Round($peerMax, 0)
+        peerTopPath = $topPath
+        ratio = $ratio
+        verdict = $verdict
+    }) -Force
+}
+
+# Would clean.ps1 refuse this path outright? True for a subtree named by the
+# never-touch `paths` list and for any path carrying a denied directory name.
+# A path that is merely "inside %USERPROFILE%" is not denied - only the profile
+# folder itself is.
+function Test-DeniedTree([string]$path) {
+    $n = $path.TrimEnd('\').ToLowerInvariant()
+    foreach ($pp in $neverPrefixPaths) {
+        $x = $pp.TrimEnd('\').ToLowerInvariant()
+        if ($x -match '^[a-z]:\\?$') { continue }
+        if ($n -eq $x -or $n.StartsWith($x + '\')) { return $true }
+    }
+    foreach ($seg in $path.Split('\')) {
+        foreach ($dn in $denyNames) {
+            if ($seg -ieq $dn) { return $true }
+        }
+    }
+    return $false
+}
+
+# ---------------- age ranking ----------------
+#
+# Everything above is driven by the rule library, so it can only ever find what
+# somebody already wrote a rule for. The age ranking is the opposite: any
+# directory above a size floor whose subtree has not been written to for N days.
+# Nothing in the rule library is consulted, which is what makes it able to
+# surface the category nobody thought of.
+#
+# Honest scope: "no writes" is not "only grows". A session log that is appended
+# every day but never pruned looks fresh here; this finds abandoned things.
+$staleDirMB = 500
+$staleDays = 30
+if ($null -ne $anomCfg.staleDirMB) { $staleDirMB = [int]$anomCfg.staleDirMB }
+if ($null -ne $anomCfg.staleDays) { $staleDays = [int]$anomCfg.staleDays }
+
+# Windows' own tree and installed programs are not "abandoned", they are
+# maintained by the OS and the installer. Ranking them would bury the real hits.
+$noAgePrefixes = @()
+foreach ($k in @('SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData')) {
+    $v = [System.Environment]::GetEnvironmentVariable($k)
+    if ($v) { $noAgePrefixes += $v.TrimEnd('\').ToLowerInvariant() }
+}
+
+$findingKeys = @()
+foreach ($f in $findings) {
+    foreach ($m in (Get-AccountingMatches $f)) { $findingKeys += ([string]$m.path).TrimEnd('\').ToLowerInvariant() }
+}
+
+$ageRank = New-Object System.Collections.Generic.List[object]
+$nowRef = Get-Date
+foreach ($r in @($snap.roots)) {
+    $rootPrefix = [string]$r.root
+    foreach ($a in @($r.ageDirs)) {
+        if (-not $a -or -not $a.path) { continue }
+        if ([int]$a.mb -lt $staleDirMB) { continue }
+        # Protected user directories are NOT skipped: "3.4 GB under Documents that
+        # nobody opened in two months" is exactly what this ranking exists to
+        # surface. The flag tells the report to suggest moving it, not deleting
+        # it - clean.ps1 refuses those paths anyway.
+        $isProtected = Test-DeniedTree ([string]$a.path)
+        $ap = ([string]$a.path).TrimEnd('\').ToLowerInvariant()
+        $skip = $false
+        foreach ($np in $noAgePrefixes) {
+            if ($ap -eq $np -or $ap.StartsWith($np + '\')) { $skip = $true; break }
+        }
+        if ($skip) { continue }
+        $dt = [datetime]::MinValue
+        if (-not [datetime]::TryParse([string]$a.newestWrite, [ref]$dt)) { continue }
+        $days = [int][math]::Floor(($nowRef - $dt).TotalDays)
+        if ($days -lt $staleDays) { continue }
+        # Already covered by a rule? Then the report should point at that finding
+        # instead of presenting it as a new discovery.
+        $hit = ''
+        foreach ($fk in $findingKeys) {
+            if ($ap -eq $fk -or $ap.StartsWith($fk + '\')) { $hit = 'in-finding'; break }
+        }
+        $ageRank.Add([pscustomobject]@{
+            path = [string]$a.path
+            mb = [int]$a.mb
+            newestWrite = [string]$a.newestWrite
+            ageDays = $days
+            depth = [int]$a.depth
+            coveredByFinding = ($hit -ne '')
+            # Inside a do-not-touch tree: worth telling the user about, not worth
+            # handing to clean.ps1.
+            protectedPath = $isProtected
+        })
+    }
+}
+
+# Nested entries are redundant in a ranking: the outer folder already contains
+# the inner one's bytes. Keep only paths that have no listed ancestor - a size
+# sort is not enough, because two entries can describe the same 3,399 MB (the
+# folder and its only child) and whichever sorts first would win at random.
+$agePathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($a in $ageRank) { [void]$agePathSet.Add(([string]$a.path).TrimEnd('\').ToLowerInvariant()) }
+
+$ageKept = New-Object System.Collections.Generic.List[object]
+foreach ($a in ($ageRank | Sort-Object mb -Descending)) {
+    $ap = ([string]$a.path).TrimEnd('\').ToLowerInvariant()
+    $hasAncestor = $false
+    $cur = $ap
+    while ($true) {
+        $ix = $cur.LastIndexOf('\')
+        if ($ix -le 2) { break }
+        $cur = $cur.Substring(0, $ix)
+        if ($agePathSet.Contains($cur)) { $hasAncestor = $true; break }
+    }
+    if (-not $hasAncestor) { $ageKept.Add($a) }
+}
+
+$staleTotalMB = 0
+foreach ($a in $ageKept) { $staleTotalMB += [int]$a.mb }
+$staleCount = $ageKept.Count
+$ageRank = @($ageKept | Select-Object -First 20)
+
 # ---------------- findings must not nest ----------------
 #
 # Rules are evaluated independently, so two findings can describe the same
@@ -565,14 +855,6 @@ foreach ($r in $snap.roots) {
 # children keep counting (under-reporting is worse than double-reporting: it
 # makes the tool promise space it cannot deliver).
 $deleteModes = @('delete-dir', 'purge-contents')
-
-# The displayed match list can be truncated (a file rule keeps the top 30 for the
-# report), while the money has to be counted on the full list. This returns
-# whichever list is authoritative for arithmetic.
-function Get-AccountingMatches($f) {
-    if ($f.PSObject.Properties['allMatches']) { return @($f.allMatches) }
-    return @($f.matches)
-}
 
 $acctMatches = New-Object System.Collections.Generic.List[object]
 foreach ($f in $findings) {
@@ -883,10 +1165,25 @@ $doc = [pscustomobject]@{
     # matched path was walked. The two count hard links differently (~1% apart),
     # so this is recorded rather than left implicit.
     sizeSource = $sizeSource
-    sizeNotes = @($sizeNotes)
+    sizeNotes = @($script:sizeNotes)
     neverTouch = @($neverFindings | Sort-Object mb -Descending)
     growth = $growth
     anomalies = @($anomalies | Sort-Object mb -Descending)
+    # Big directories nobody has written to in a while. Rule-free by design: this
+    # is the only part of the analysis that can surface a category the rule
+    # library has never heard of.
+    age = [pscustomobject]@{
+        thresholdMB = $staleDirMB
+        thresholdDays = $staleDays
+        totalMB = $staleTotalMB
+        # count covers every qualifying directory; dirs is capped for the report.
+        count = $staleCount
+        dirs = @($ageRank)
+        # Empty is ambiguous otherwise: walk snapshots carry no timestamps, so the
+        # ranking could be empty because nothing is stale or because it could not
+        # be measured at all.
+        note = $(if ($curEngine -eq 'mft') { 'ageDays is measured from the newest write time anywhere in the subtree, so a single recent file keeps its parents fresh. A large directory can therefore be absent here and still never shrink.' } else { 'the snapshot came from the walk engine, which records no timestamps; the age ranking needs engine=mft.' })
+    }
     topDirs = @($snap.roots | ForEach-Object {
         $r = $_
         $r.buckets | ForEach-Object {
@@ -910,4 +1207,4 @@ $doc | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $OutFile -Encoding UT
 
 $prevEngineTag = 'none'
 if ($prevEngine -ne '') { $prevEngineTag = $prevEngine }
-Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource + ' overlapMB=' + [math]::Round($overlapMB, 0) + ' reconcile=' + $reconcileCode + ' projFreeMB=' + $projFreeTotalMB)
+Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource + ' overlapMB=' + [math]::Round($overlapMB, 0) + ' reconcile=' + $reconcileCode + ' projFreeMB=' + $projFreeTotalMB + ' stale=' + $ageRank.Count + ' staleMB=' + $staleTotalMB)

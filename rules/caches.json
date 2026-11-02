@@ -491,6 +491,8 @@
   "anomaly": {
     "cacheDirMB": 5120,
     "anyDirMB": 25600,
-    "note": "单个缓存类目录超过 cacheDirMB 即视为异常膨胀；单个普通目录超过 anyDirMB 提示人工确认"
+    "staleDirMB": 500,
+    "staleDays": 30,
+    "note": "单个缓存类目录超过 cacheDirMB 即视为异常膨胀；单个普通目录超过 anyDirMB 提示人工确认；超过 staleDirMB 且 staleDays 天内整个子树没有任何写入的目录进入 Age 榜（需要 mft 引擎）"
   }
 }
