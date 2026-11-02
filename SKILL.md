@@ -41,7 +41,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径的定向测尺：一次 $MFT 解析给出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，由 scan.ps1 / dirsizes.ps1 用 Add-Type 编译）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 自检：75 项断言，全在临时目录里跑，不碰真实数据
+│   └── selftest.ps1       # 自检：83 项断言，全在临时目录里跑，不碰真实数据
 ├── references/
 │   └── report-format.md   # 对话内报告模板
 └── fixtures/
@@ -86,7 +86,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 & "$S\scripts\analyze.ps1" -Snapshot '<上一步的json路径>'
 ```
 
-输出 `RESULT <analysis json> findings=... safeMB=... cautionMB=... growth=... anomalies=... engine=... sizeSource=... overlapMB=... reconcile=...`。
+输出 `RESULT <analysis json> findings=... safeMB=... cautionMB=... growth=... anomalies=... engine=... sizeSource=... overlapMB=... reconcile=... projFreeMB=...`。
 
 把 analysis JSON 读进来，按 `findings` / `growth` / `anomalies` / `neverTouch` 组织报告。
 
@@ -127,6 +127,33 @@ analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `clean
 
 报告里提"可释放 X GB"时用 `totals.reclaimableMB`；若 `overlapMB > 0`，加一句"已剔除 N 条重叠（约 Y GB），清单里保留展示但不重复计入"。
 
+**关于 `projection`（清完之后还剩多少）**：
+
+`totals` 回答"能拿回多少"，`projection` 回答"拿回之后剩多少" —— 后者才是用户做决定的依据。逐盘给，不合并：
+
+```json
+"projection": {
+  "drives": [ { "mount": "C:", "totalMB": 168839, "freeMB": 17177, "freePct": 10.2,
+                "safeMB": 27600, "cautionMB": 27035,
+                "afterSafeMB": 44777, "afterSafePct": 26.5,
+                "afterAllMB": 71812, "afterAllPct": 42.5,
+                "crossesPct": [20] } ],
+  "projectedFreeMB": 111462, "projectedFreeAllMB": 138497,
+  "warnings": [],
+  "note": "Estimate, not a measurement. ..."
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `drives[].afterSafeMB` / `afterSafePct` | 清完 ✅ 档后的剩余与可用率 —— 报告主用这个 |
+| `drives[].afterAllMB` / `afterAllPct` | 连 ⚠️ 档也清完的**上界**（不一定全删，只能写"最多"） |
+| `drives[].crossesPct` | 清完会越过哪几条线（5/10/20%），空数组表示没跨线 |
+| `warnings` | 清完仍 < 5% 的盘，**必须转述**，不许只报喜 |
+| `projectedFreeMB` | 所有盘合计（多盘机器上别当成某一块盘的剩余） |
+
+两条口径必须一起说：体积按目录项算，硬链接文件另一个名字还在时并不会真释放；`clean.ps1` 默认删到**回收站**，要清空回收站空间才回到可用空间。真实释放量以 `clean.ps1` 的 `volumeReclaimedMB` 为准，投影只是估算。
+
 **关于 `reconcile`（三个总量对账）**：
 
 ```json
@@ -151,7 +178,7 @@ analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `clean
 必须包含的四块：
 1. **空间去向** —— 各顶层目录体积
 2. **为什么变快** —— `growth` 里的增长榜（首次运行无历史时说明本次不适用）
-3. **可删清单** —— 按 `risk` 分 safe / caution 两档，每项给出体积与清理方式
+3. **可删清单** —— 按 `risk` 分 safe / caution 两档，每项给出体积与清理方式；清单末尾紧跟一句"清完剩约 XX GB（XX%）"（取 `projection`）
 4. **别删清单** —— 用 `neverTouch` 说明哪些不能动
 
 `anomalies` 里的条目要单独醒目提示（这是发现"隐形大户"的关键）。
@@ -235,9 +262,9 @@ analyze 末尾会做一次包含关系判定：**只有当父 finding 的 `clean
 & "$S\scripts\selftest.ps1"
 ```
 
-末行输出 `SELFTEST pass=75 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
+末行输出 `SELFTEST pass=83 fail=0 skip=0` 或 `RESULT-FAIL`。缺管理员权限时 MFT 相关断言会报 `SKIP` 而不是 `FAIL`（这是刻意的：**换一台没有管理员权限的机器也必须能跑通**）。
 
-覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）、嵌套 findings 只计一次且 manual 父项不吃子项（T17）、inode 口径与硬链接数自洽（T18）、clean 删后复查（T19）。
+覆盖范围：增长对比、增长对比的 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性、System32 拒绝、盘符根子目录拒绝、批量上限、dry-run 不删除、无 `-Confirmed` 不执行、规则通配符解析、文件名规则匹配与去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一条规则内重叠 pattern 只计一次（T16）、嵌套 findings 只计一次且 manual 父项不吃子项（T17）、inode 口径与硬链接数自洽（T18）、clean 删后复查（T19）、空间投影按盘归属且不重复计入（T20）。
 
 > T19 会真的把一个 500 字节的临时目录移进回收站 —— 这是唯一能证明"删后复查"有效的方式，清理它不影响任何东西。
 

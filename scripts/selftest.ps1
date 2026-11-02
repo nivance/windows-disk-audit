@@ -666,6 +666,64 @@ if (Test-Path -LiteralPath $c19) {
 }
 else { Check 'T19a clean reports verification counts' $false 'no clean output' }
 
+# ---- T20 free space projection must be per volume and must not double count ----
+# The projection answers "what is free space after I clear the safe items".
+# Two ways to get it wrong: credit a D: finding to C:, and count a nested match
+# that the parent already takes with it. Both are checked against the same
+# fixture T17 used, where the correct safe total is 5MB (not 7MB).
+$o20 = Invoke-Stage 'analyze.ps1' @{ Snapshot = $snapNew; RulesFile = $nestRules; MinFindingMB = 0 } $auditHome
+$r20 = Get-Result $o20
+$an20 = ''
+if ($r20 -ne '') { $an20 = ($r20 -split ' ')[1] }
+Check 'T20a projection block is present' ($r20 -like '*projFreeMB=*') $o20
+if (Test-Path -LiteralPath $an20) {
+    $d20 = Get-Content -LiteralPath $an20 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $rows = @($d20.projection.drives)
+    Check 'T20b projection has one row per volume' ($rows.Count -eq @($d20.drives).Count) (
+        'rows=' + $rows.Count + ' drives=' + @($d20.drives).Count)
+
+    $clampOk = $true
+    $monoOk = $true
+    $sumSafe = 0
+    foreach ($row in $rows) {
+        $expect = [double]$row.freeMB + [double]$row.safeMB
+        if ($expect -gt [double]$row.totalMB) { $expect = [double]$row.totalMB }
+        if ([math]::Abs($expect - [double]$row.afterSafeMB) -gt 1) { $clampOk = $false }
+        if ([double]$row.afterAllMB -lt [double]$row.afterSafeMB) { $monoOk = $false }
+        $sumSafe += [double]$row.safeMB
+    }
+    Check 'T20c every row is free plus safe, clamped to the volume size' $clampOk (
+        (($rows | ForEach-Object { $_.mount + ' free=' + $_.freeMB + ' safe=' + $_.safeMB + ' after=' + $_.afterSafeMB }) -join '; '))
+    Check 'T20d clearing caution too never lowers the projection' $monoOk (
+        (($rows | ForEach-Object { $_.mount + ' safe=' + $_.afterSafeMB + ' all=' + $_.afterAllMB }) -join '; '))
+    # The snapshot covers one volume, so the per-volume safe space has to add up
+    # to the headline figure exactly.
+    Check 'T20e per-volume safe space adds up to totals.safeMB' ([math]::Abs($sumSafe - [double]$d20.totals.safeMB) -le 1) (
+        'sum=' + $sumSafe + ' totals.safeMB=' + $d20.totals.safeMB)
+
+    $nestDrive = ([string]$tmp).Substring(0, 1).ToUpperInvariant() + ':'
+    $nestRow = $null
+    foreach ($row in $rows) { if ($row.mount -eq $nestDrive) { $nestRow = $row } }
+    Check 'T20f the nested fixture projects 5MB, not 7MB' ($nestRow -and [int]$nestRow.safeMB -eq 5) (
+        'drive=' + $nestDrive + ' safeMB=' + $(if ($nestRow) { $nestRow.safeMB } else { 'n/a' }))
+
+    $idleOk = $true
+    $idleDetail = @()
+    foreach ($row in $rows) {
+        if ([double]$row.safeMB -eq 0 -and [double]$row.cautionMB -eq 0) {
+            if ([double]$row.afterSafeMB -ne [double]$row.freeMB) { $idleOk = $false }
+            $idleDetail += ($row.mount + ' free=' + $row.freeMB + ' after=' + $row.afterSafeMB)
+        }
+    }
+    Check 'T20g a drive with no findings projects unchanged free space' $idleOk ($idleDetail -join '; ')
+
+    $rowSum = 0
+    foreach ($row in $rows) { $rowSum += [double]$row.afterSafeMB }
+    Check 'T20h projectedFreeMB equals the sum of the rows' ([math]::Abs($rowSum - [double]$d20.projection.projectedFreeMB) -le 1) (
+        'rows=' + $rowSum + ' headline=' + $d20.projection.projectedFreeMB)
+}
+else { Check 'T20a projection block is present' $false 'no analysis output' }
+
 # ---- T10 ASCII guard ----
 $bad = @()
 foreach ($name in @('scan.ps1', 'analyze.ps1', 'clean.ps1', 'selftest.ps1', 'dirsizes.ps1')) {

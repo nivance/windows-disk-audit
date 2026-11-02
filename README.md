@@ -75,10 +75,11 @@ C 盘从"还剩 50 GB"到"飘红"，通常是无声发生的。已有的工具�
 | **双口径总量** | 同一趟 `$MFT` 解析同时给出「按目录项」（与资源管理器一致）和「按 inode 去重」两个总量，并附 `reconcile` 对账块解释它们与卷已用空间的差额 |
 | **可释放量不重复** | findings 之间有包含关系时（大日志在会话目录里），只有父项是 `delete-dir` 才剔除子项；`manual` 父项不吃子项，宁可少报也不虚报 |
 | **清理有回执** | 删完不只看返回值：逐项 `Test-Path` 复查 + 卷剩余空间前后差，`verified` 才是"确实没了" |
+| **清完剩多少** | 不只说"能释放 27 GB"，还按盘给出清完之后的剩余与可用率（`projection`），并标出会越过 5%/10%/20% 哪条线 |
 | **异常膨胀检测** | 单个缓存类目录 > 5 GB 直接标红。**这是挖出"隐形大户"的关键** —— 纯看总量发现不了它 |
 | **默认进回收站** | 用 `SHFileOperation` + `FOF_ALLOWUNDO`，误删可从回收站找回 |
 | **零依赖** | 只需系统自带的 PowerShell 5.1+，无需任何运行时 |
-| **自带回归测试** | 75 项断言，1 分钟跑完，全部在临时目录内运行，不碰真实数据；缺管理员权限时 MFT 断言报 SKIP 而非 FAIL |
+| **自带回归测试** | 83 项断言，1 分钟跑完，全部在临时目录内运行，不碰真实数据；缺管理员权限时 MFT 断言报 SKIP 而非 FAIL |
 
 ## 快速开始
 
@@ -197,6 +198,20 @@ System32 / WinSxS（硬链接，手删会搞坏系统）/ Fonts / Program Files 
             "overlapMB": 4043, "overlapCount": 6 }
 ```
 
+`projection` 回答另一半问题 —— 清完之后还剩多少（真实数据，C: 165 GB）：
+
+```json
+"projection": {
+  "drives": [ { "mount": "C:", "totalMB": 168839, "freeMB": 17177, "freePct": 10.2,
+                "safeMB": 27600, "cautionMB": 27035,
+                "afterSafeMB": 44777, "afterSafePct": 26.5,
+                "afterAllMB": 71812, "afterAllPct": 42.5, "crossesPct": [20] } ],
+  "projectedFreeMB": 111462, "warnings": []
+}
+```
+
+逐盘给而不是合成一个数（D: 的 finding 不该算进 C: 的剩余），`afterAllMB` 是连 ⚠️ 档也清完的上界。这是**估算**：体积按目录项算，硬链接另一个名字还在就不释放；而且默认删到回收站，清空后才真正回到可用空间。
+
 ## 安全设计
 
 这个项目需要**删除能力**，所以安全约束是硬编码进脚本的，不是文档里的软建议：
@@ -220,7 +235,7 @@ windows-disk-audit/
 │   ├── dirsizes.ps1       # 规则路径定向测尺：一次 $MFT 解析量出几十个目录的体积
 │   ├── MftScan.cs         # NTFS $MFT 解析器（C#，Add-Type 就地编译，无外部依赖）
 │   ├── clean.ps1          # 移入回收站（需 -Confirmed）
-│   └── selftest.ps1       # 75 项回归断言
+│   └── selftest.ps1       # 83 项回归断言
 ├── rules/
 │   ├── caches.json        # 可清理规则库（36 条目录规则 + 5 条文件名规则）
 │   └── never-touch.json   # 红线目录，clean.ps1 的硬校验依据
@@ -261,10 +276,10 @@ windows-disk-audit/
 
 ```powershell
 & "$S\scripts\selftest.ps1"     # 约 1 分钟
-# 末行：SELFTEST pass=75 fail=0 skip=0 / RESULT-PASS
+# 末行：SELFTEST pass=83 fail=0 skip=0 / RESULT-PASS
 ```
 
-覆盖：增长对比与 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性（对已知 3 MB 文件）、System32 必须被拒绝、盘符根子目录必须被拒绝、批量上限、dry-run 零删除、无 `-Confirmed` 不动手、规则通配符解析、文件名规则去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一规则内重叠 pattern 只计一次、嵌套 findings 只计一次且 `manual` 父项不吃子项、inode 口径与硬链接数自洽、clean 删后复查。
+覆盖：增长对比与 root/depth 匹配、引擎一致性标记（同引擎 / 跨引擎 / 无历史三态）、首次运行无历史、体积计算正确性（对已知 3 MB 文件）、System32 必须被拒绝、盘符根子目录必须被拒绝、批量上限、dry-run 零删除、无 `-Confirmed` 不动手、规则通配符解析、文件名规则去重、随包规则文件结构校验、脚本纯 ASCII 校验、`MftScan.cs` 可编译、非卷根参数被拒、MFT 测尺对已知目录给出正确体积、`-Engine walk` 被尊重、两种测尺引擎不改变 findings 集合、同一规则内重叠 pattern 只计一次、嵌套 findings 只计一次且 `manual` 父项不吃子项、inode 口径与硬链接数自洽、clean 删后复查、空间投影按盘归属且不重复计入嵌套项。
 
 其中"删后复查"会真的把一个 500 字节的临时目录移进回收站 —— 这是唯一能证明复查逻辑有效的方式。
 

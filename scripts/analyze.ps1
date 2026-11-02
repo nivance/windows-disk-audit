@@ -358,6 +358,10 @@ foreach ($fr in $rules.fileRules) {
         mb = $sum
         matchCount = $matched.Count
         matches = @($matched | Select-Object -First 30)
+        # The report only needs the biggest 30 names, but the accounting needs
+        # every one of them: a rule that matches 200 log files would otherwise
+        # project only its first 30. Stripped before the JSON is written.
+        allMatches = @($matched)
     })
 }
 
@@ -561,10 +565,19 @@ foreach ($r in $snap.roots) {
 # children keep counting (under-reporting is worse than double-reporting: it
 # makes the tool promise space it cannot deliver).
 $deleteModes = @('delete-dir', 'purge-contents')
-$allMatches = New-Object System.Collections.Generic.List[object]
+
+# The displayed match list can be truncated (a file rule keeps the top 30 for the
+# report), while the money has to be counted on the full list. This returns
+# whichever list is authoritative for arithmetic.
+function Get-AccountingMatches($f) {
+    if ($f.PSObject.Properties['allMatches']) { return @($f.allMatches) }
+    return @($f.matches)
+}
+
+$acctMatches = New-Object System.Collections.Generic.List[object]
 foreach ($f in $findings) {
-    foreach ($m in $f.matches) {
-        $allMatches.Add([pscustomobject]@{
+    foreach ($m in (Get-AccountingMatches $f)) {
+        $acctMatches.Add([pscustomobject]@{
             key  = ([string]$f.id + '||' + ([string]$m.path).TrimEnd('\').ToLowerInvariant())
             id   = [string]$f.id
             mode = [string]$f.cleanMode
@@ -575,10 +588,10 @@ foreach ($f in $findings) {
 }
 
 $coveredBy = @{}
-foreach ($m in $allMatches) {
+foreach ($m in $acctMatches) {
     $bestId = ''
     $bestLen = -1
-    foreach ($o in $allMatches) {
+    foreach ($o in $acctMatches) {
         if ($o.key -eq $m.key) { continue }
         # Matches of the same finding were already de-duplicated when the rule
         # was resolved; comparing them here would just subtract a finding from
@@ -597,28 +610,37 @@ $overlapMB = 0
 $overlapPairs = 0
 $overlapEdges = New-Object System.Collections.Generic.List[object]
 foreach ($f in $findings) {
+    $acct = @(Get-AccountingMatches $f)
     $covMB = 0
-    $covCount = 0
+    $covAcct = 0
     $parents = @{}
-    foreach ($m in $f.matches) {
+    foreach ($m in $acct) {
         $k = ([string]$f.id + '||' + ([string]$m.path).TrimEnd('\').ToLowerInvariant())
         if ($coveredBy.ContainsKey($k)) {
             $covMB += [double]$m.mb
-            $covCount++
+            $covAcct++
             $pid2 = $coveredBy[$k]
             if (-not $parents.ContainsKey($pid2)) { $parents[$pid2] = 0 }
             $parents[$pid2] = $parents[$pid2] + [double]$m.mb
         }
     }
+    # How many of the *displayed* matches are covered. Reporting the accounting
+    # count here would print "12 of 3 matches nested" whenever the list is
+    # truncated, which reads like a bug.
+    $covShown = 0
+    foreach ($m in @($f.matches)) {
+        $k = ([string]$f.id + '||' + ([string]$m.path).TrimEnd('\').ToLowerInvariant())
+        if ($coveredBy.ContainsKey($k)) { $covShown++ }
+    }
     $eff = [double]$f.mb - $covMB
     if ($eff -lt 0) { $eff = 0 }
     $f | Add-Member -NotePropertyName effectiveMB -NotePropertyValue ([math]::Round($eff, 0)) -Force
     $f | Add-Member -NotePropertyName coveredMB -NotePropertyValue ([math]::Round($covMB, 0)) -Force
-    $f | Add-Member -NotePropertyName coveredCount -NotePropertyValue $covCount -Force
+    $f | Add-Member -NotePropertyName coveredCount -NotePropertyValue $covShown -Force
     $f | Add-Member -NotePropertyName coveredBy -NotePropertyValue @($parents.Keys | Sort-Object) -Force
-    $f | Add-Member -NotePropertyName subsumed -NotePropertyValue ($covCount -gt 0 -and $covCount -eq @($f.matches).Count) -Force
+    $f | Add-Member -NotePropertyName subsumed -NotePropertyValue ($covAcct -gt 0 -and $covAcct -eq $acct.Count) -Force
     $overlapMB += $covMB
-    $overlapPairs += $covCount
+    $overlapPairs += $covAcct
     foreach ($pn in $parents.Keys) {
         $overlapEdges.Add([pscustomobject]@{
             child = [string]$f.id
@@ -688,6 +710,108 @@ else {
                       'directory-entry total, which double counts hard links.')
 }
 
+# ---------------- space projection ----------------
+#
+# What the volume looks like once the findings are actually gone. Two things
+# make a naive `freeMB + safeMB` wrong:
+#   1. Attribution must be per volume. A finding on D: must never inflate the
+#      projection for C:, and the two drives in one snapshot are usually very
+#      different sizes.
+#   2. A match that a containing delete-capable parent already takes with it is
+#      not paid for twice. That is the same rule the totals use, so the
+#      projection and the "reclaimable" headline cannot disagree.
+# The result is deliberately labelled an estimate: sizes come from directory
+# entries, and a hard-linked file that keeps another name frees nothing when
+# its entry is removed. clean.ps1 measures the real number afterwards.
+$volSafe = @{}
+$volCaution = @{}
+foreach ($f in $findings) {
+    $isSafe = ($f.risk -eq 'safe')
+    if (-not $isSafe -and $f.risk -ne 'caution') { continue }
+    foreach ($m in (Get-AccountingMatches $f)) {
+        $k = ([string]$f.id + '||' + ([string]$m.path).TrimEnd('\').ToLowerInvariant())
+        if ($coveredBy.ContainsKey($k)) { continue }
+        $p = [string]$m.path
+        if ($p.Length -lt 2 -or $p[1] -ne ':') { continue }
+        $letter = $p.Substring(0, 1).ToUpperInvariant() + ':'
+        if ($isSafe) {
+            if (-not $volSafe.ContainsKey($letter)) { $volSafe[$letter] = [double]0 }
+            $volSafe[$letter] = $volSafe[$letter] + [double]$m.mb
+        }
+        else {
+            if (-not $volCaution.ContainsKey($letter)) { $volCaution[$letter] = [double]0 }
+            $volCaution[$letter] = $volCaution[$letter] + [double]$m.mb
+        }
+    }
+}
+
+$projections = New-Object System.Collections.Generic.List[object]
+$projFreeTotalMB = [int64]0
+$projFreeTotalAllMB = [int64]0
+$projWarnings = @()
+foreach ($dv in @($snap.drives)) {
+    $letter = ([string]$dv.mount).ToUpperInvariant()
+    $sMb = 0; $cMb = 0
+    if ($volSafe.ContainsKey($letter)) { $sMb = $volSafe[$letter] }
+    if ($volCaution.ContainsKey($letter)) { $cMb = $volCaution[$letter] }
+    $totalD = [double]$dv.totalMB
+    $freeD = [double]$dv.freeMB
+    if ($totalD -le 0) { continue }
+
+    $afterSafe = $freeD + $sMb
+    $afterAll = $freeD + $sMb + $cMb
+    # A projection above the volume size would be nonsense; clamp instead of
+    # printing a number that cannot exist.
+    if ($afterSafe -gt $totalD) { $afterSafe = $totalD }
+    if ($afterAll -gt $totalD) { $afterAll = $totalD }
+
+    $freePctNow = [math]::Round(($freeD / $totalD) * 100, 1)
+    $freePctSafe = [math]::Round(($afterSafe / $totalD) * 100, 1)
+    $freePctAll = [math]::Round(($afterAll / $totalD) * 100, 1)
+
+    # Which free-space marks the safe cleanup would carry the drive back over.
+    # 5% is where Windows starts refusing updates and hibernation; 10% is the
+    # usual comfortable floor; 20% is where defrag and updates stop complaining.
+    $crosses = @()
+    foreach ($mark in @(5, 10, 20)) {
+        if ($freePctNow -lt $mark -and $freePctSafe -ge $mark) { $crosses += $mark }
+    }
+    if ($freePctSafe -lt 5) {
+        if ($cMb -gt 0) {
+            $projWarnings += ($letter + ' stays under 5% free even after every safe item is removed; the caution items are the only way out.')
+        }
+        else {
+            $projWarnings += ($letter + ' stays under 5% free after every safe item is removed and there is nothing left at caution level.')
+        }
+    }
+
+    $projections.Add([pscustomobject]@{
+        mount = $letter
+        label = [string]$dv.label
+        totalMB = [math]::Round($totalD, 0)
+        freeMB = [math]::Round($freeD, 0)
+        freePct = $freePctNow
+        safeMB = [math]::Round($sMb, 0)
+        cautionMB = [math]::Round($cMb, 0)
+        # The headline: what you get by clearing everything the tool graded safe.
+        afterSafeMB = [math]::Round($afterSafe, 0)
+        afterSafePct = $freePctSafe
+        # Upper bound only: caution items need a human decision each.
+        afterAllMB = [math]::Round($afterAll, 0)
+        afterAllPct = $freePctAll
+        crossesPct = @($crosses)
+    })
+    $projFreeTotalMB += [int64]([math]::Round($afterSafe, 0))
+    $projFreeTotalAllMB += [int64]([math]::Round($afterAll, 0))
+}
+
+# The full match lists existed only for the arithmetic above. Leaving them in
+# would double the JSON size and confuse a reader who compares `matches` with
+# `matchCount`.
+foreach ($f in $findings) {
+    if ($f.PSObject.Properties['allMatches']) { $f.PSObject.Properties.Remove('allMatches') }
+}
+
 $doc = [pscustomobject]@{
     schema = 1
     analyzedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -725,6 +849,23 @@ $doc = [pscustomobject]@{
         # see the correction instead of having to trust it.
         overlapMB = [math]::Round($overlapMB, 0)
         overlapCount = $overlapPairs
+    }
+    # "Clear the safe items and this is what free space looks like." Per volume,
+    # clamped to the volume size, and never counting a nested match twice.
+    projection = [pscustomobject]@{
+        # .ToArray(), not @($projections): wrapping a generic List inside a
+        # pscustomobject hashtable throws "Argument types do not match" on
+        # PowerShell 5.1, and the error points at an unrelated line.
+        drives = $projections.ToArray()
+        projectedFreeMB = $projFreeTotalMB
+        projectedFreeAllMB = $projFreeTotalAllMB
+        warnings = @($projWarnings)
+        # clean.ps1 sends files to the Recycle Bin on purpose (undo beats disk
+        # space), so the bytes only turn into free space once the bin is
+        # emptied. Any projection that omits this reads as "instant".
+        note = ('Estimate, not a measurement. Sizes come from directory entries, so a hard-linked file that keeps ' +
+                'another name frees less than its entry size suggests. Selected items are moved to the Recycle Bin, ' +
+                'so the space appears only after the bin is emptied; clean.ps1 reports the measured figure separately.')
     }
     overlap = @($overlapEdges | Sort-Object mb -Descending)
     reconcile = [pscustomobject]@{
@@ -769,4 +910,4 @@ $doc | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $OutFile -Encoding UT
 
 $prevEngineTag = 'none'
 if ($prevEngine -ne '') { $prevEngineTag = $prevEngine }
-Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource + ' overlapMB=' + [math]::Round($overlapMB, 0) + ' reconcile=' + $reconcileCode)
+Write-Host ('RESULT ' + $OutFile + ' findings=' + $findings.Count + ' safeMB=' + $safeMB + ' cautionMB=' + $cautionMB + ' growth=' + $growth.Count + ' anomalies=' + $anomalies.Count + ' engine=' + $curEngine + ' prevEngine=' + $prevEngineTag + ' engineMismatch=' + $engineMismatch + ' totalDeltaMB=' + $totalDeltaMB + ' sizeSource=' + $sizeSource + ' overlapMB=' + [math]::Round($overlapMB, 0) + ' reconcile=' + $reconcileCode + ' projFreeMB=' + $projFreeTotalMB)
