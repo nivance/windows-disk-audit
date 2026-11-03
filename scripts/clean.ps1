@@ -291,11 +291,26 @@ foreach ($a in $accepted) {
     else {
         try {
             if ($a.mode -eq 'purge-contents') {
+                # A live directory (Temp especially) is being written while we
+                # enumerate it, so entries can vanish between the listing and the
+                # delete. rc=2 means exactly that - already gone, which is the
+                # goal - so it is a skip, not a failure. Other errors are logged
+                # but do not abort the run: one locked file should not keep the
+                # remaining entries from moving.
                 $kids = [System.IO.Directory]::GetFileSystemEntries((Add-Prefix $a.path))
+                $errCount = 0
                 foreach ($k in $kids) {
                     $rc = [RecycleBin]::Delete($k)
-                    if ($rc -ne 0) { $ok = $false; $err = ('SHFileOperation rc=' + $rc); break }
+                    if ($rc -eq 2) { continue }
+                    if ($rc -ne 0) {
+                        $errCount++
+                        if ($errCount -le 5) {
+                            $err = ('SHFileOperation rc=' + $rc + ' on ' + [System.IO.Path]::GetFileName($k))
+                        }
+                    }
                 }
+                if ($errCount -gt 5) { $err = ($err + ' (+ ' + ($errCount - 5) + ' more skipped)') }
+                if ($errCount -gt 0) { $ok = $false }
             }
             else {
                 $rc = [RecycleBin]::Delete((Add-Prefix $a.path))
